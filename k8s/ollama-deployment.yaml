@@ -1,0 +1,48 @@
+# This is an example manifest for deploying Ollama in your k3s cluster.
+# For production use, you should consider using a PersistentVolume for model storage.
+# See the Ollama Docker documentation for more details: https://hub.docker.com/r/ollama/ollama
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-deployment
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+        # To keep models between restarts, you should mount a volume.
+        # This example uses an emptyDir volume, which is ephemeral.
+        # For persistence, you should use a PersistentVolumeClaim.
+        volumeMounts:
+        - name: ollama-models
+          mountPath: /root/.ollama
+      volumes:
+      - name: ollama-models
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+spec:
+  selector:
+    app: ollama
+  ports:
+    - protocol: TCP
+      port: 11434
+      targetPort: 11434
+  type: ClusterIP # Expose the service only within the cluster

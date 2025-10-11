@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent-deployment
+  labels:
+    app: ai-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-agent
+  template:
+    metadata:
+      labels:
+        app: ai-agent
+    spec:
+      containers:
+      - name: ai-agent
+        # This image will be pulled from Docker Hub.
+        # The tag should be updated to a specific version for production use.
+        image: jarcher1200/swe-agent:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OLLAMA_MODEL
+          value: "llama2" # Or whichever model you prefer
+        # This assumes Ollama is running and accessible at this address.
+        # If running Ollama in the same cluster, you can use its service name.
+        - name: OLLAMA_HOST
+          value: "http://ollama-service:11434"
