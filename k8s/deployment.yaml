@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent-deployment
+  labels:
+    app: ai-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-agent
+  template:
+    metadata:
+      labels:
+        app: ai-agent
+    spec:
+      containers:
+      - name: ai-agent
+        # IMPORTANT: Replace this with the path to your container image
+        # For example, if using GHCR: ghcr.io/YOUR_USERNAME/YOUR_REPONAME:latest
+        image: ghcr.io/jules-labs/k3s-deployable-agent:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OLLAMA_MODEL
+          value: "llama2" # Or whichever model you prefer
+        # This assumes Ollama is running and accessible at this address.
+        # If running Ollama in the same cluster, you can use its service name.
+        - name: OLLAMA_HOST
+          value: "http://ollama-service:11434"
