@@ -28,12 +28,29 @@ spec:
         # If running Ollama in the same cluster, you can use its service name.
         - name: OLLAMA_HOST
           value: "http://ollama-service:11434"
-        # Optional API authentication. Leave unset to rely on ClusterIP + NetworkPolicy.
-        # Create the secret with:
-        #   kubectl create secret generic ai-agent-secrets --from-literal=api-key='YOUR_KEY'
-        # Then uncomment:
-        # - name: API_KEY
-        #   valueFrom:
-        #     secretKeyRef:
-        #       name: ai-agent-secrets
-        #       key: api-key
+        # Liveness: process is up (does not require the model).
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # Startup: wait until the configured model is pulled before marking started.
+        # Allows a long window so operators can pull the model after Ollama is up.
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 36  # up to ~6 minutes
+        # Readiness: only receive traffic when the model is available.
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
