@@ -6,6 +6,7 @@ This project provides a template for creating a k3s-deployable AI agent that wra
 
 *   **FastAPI Backend**: A Python-based backend using FastAPI to serve the agent's API.
 *   **Ollama Integration**: Pre-configured to connect to an Ollama instance for LLM inference.
+*   **Durable Feedback Storage**: Feedback is persisted via pluggable backends (`sqlite` or `file`).
 *   **Dockerized**: Comes with a `Dockerfile` for easy containerization.
 *   **Kubernetes Ready**: Includes k3s-compatible deployment and service manifests.
 *   **GitHub Actions CI/CD**: An automated workflow to test the application, build, and push the Docker image to a container registry.
@@ -40,16 +41,79 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
     ```
     The application will be available at `http://127.0.0.1:8000`.
 
+    By default feedback is stored in `data/feedback.db` (SQLite). Override with env vars (see below).
+
 ## API Endpoints
 
 *   `POST /api/generate`: Takes a prompt and returns a response from the LLM.
-*   `POST /api/feedback`: Accepts feedback on the agent's responses and **persists** it to a local JSONL store for later training/review. Each submission returns a `feedback_id`.
+*   `POST /api/feedback`: Submits feedback on the agent's responses; persists the record and returns a `feedback_id`.
+*   `GET /api/feedback/{feedback_id}`: Retrieves a previously stored feedback record by ID.
 
-### Feedback storage
+## Feedback storage
 
-Feedback records are appended to a JSON Lines file (one JSON object per line). By default the path is `data/feedback.jsonl`. Override it with the `FEEDBACK_STORE_PATH` environment variable (useful for tests or alternative mounts in Kubernetes).
+Feedback is written through a pluggable storage layer (`src/storage.py`).
 
-Each record includes: `feedback_id`, `prompt`, `response`, `is_correct`, and optional `correction`.
+| Backend | Env value | `FEEDBACK_STORAGE_PATH` meaning | Default path |
+|---------|-----------|----------------------------------|--------------|
+| SQLite  | `sqlite` (default) | Path to a `.db` file | `data/feedback.db` |
+| File    | `file` | Directory of one JSON file per record | `data/feedback` |
+
+Environment variables:
+
+*   `FEEDBACK_STORAGE_BACKEND` — `sqlite` or `file` (default: `sqlite`)
+*   `FEEDBACK_STORAGE_PATH` — backend-specific path (see table)
+
+Example (file backend):
+
+```bash
+export FEEDBACK_STORAGE_BACKEND=file
+export FEEDBACK_STORAGE_PATH=./data/feedback
+uvicorn src.main:app --reload
+```
+
+### Volume mounts (Docker)
+
+Persist feedback across container restarts by mounting a host directory (or named volume) at `/app/data`:
+
+```bash
+# SQLite (default path inside the container: /app/data/feedback.db)
+docker run -d \
+  -p 8000:8000 \
+  -v swe-agent-data:/app/data \
+  -e FEEDBACK_STORAGE_BACKEND=sqlite \
+  -e FEEDBACK_STORAGE_PATH=/app/data/feedback.db \
+  ghcr.io/YOUR_USERNAME/YOUR_REPONAME:latest
+
+# File backend (JSON files under /app/data/feedback)
+docker run -d \
+  -p 8000:8000 \
+  -v swe-agent-data:/app/data \
+  -e FEEDBACK_STORAGE_BACKEND=file \
+  -e FEEDBACK_STORAGE_PATH=/app/data/feedback \
+  ghcr.io/YOUR_USERNAME/YOUR_REPONAME:latest
+```
+
+Bind-mount a host path instead of a named volume if preferred:
+
+```bash
+docker run -d -p 8000:8000 -v /var/lib/swe-agent:/app/data ...
+```
+
+### Volume mounts (Kubernetes)
+
+The manifests under `k8s/` mount a PersistentVolumeClaim at `/app/data` and set storage env vars. Apply as usual:
+
+```bash
+kubectl apply -f k8s/
+```
+
+Key pieces in `k8s/deployment.yaml`:
+
+*   PVC `ai-agent-data` mounted at `/app/data`
+*   `FEEDBACK_STORAGE_BACKEND=sqlite`
+*   `FEEDBACK_STORAGE_PATH=/app/data/feedback.db`
+
+Adjust the PVC size/storage class in `k8s/pvc.yaml` for your cluster.
 
 ## Deployment
 

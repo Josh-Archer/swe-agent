@@ -4,99 +4,199 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from src.storage import (
+    FileFeedbackStorage,
+    FeedbackRecord,
+    SqliteFeedbackStorage,
+    create_feedback_storage,
+)
+
+
+# --- Storage unit tests ---
+
+def test_sqlite_storage_save_and_get(tmp_path: Path):
+    storage = SqliteFeedbackStorage(tmp_path / "feedback.db")
+    record = FeedbackRecord(
+        feedback_id="abc123",
+        prompt="What is 2+2?",
+        response="4",
+        is_correct=True,
+        correction=None,
+    )
+    storage.save(record)
+    loaded = storage.get("abc123")
+    assert loaded is not None
+    assert loaded.feedback_id == "abc123"
+    assert loaded.prompt == "What is 2+2?"
+    assert loaded.response == "4"
+    assert loaded.is_correct is True
+    assert loaded.correction is None
+    assert storage.get("missing") is None
+
+
+def test_file_storage_save_and_get(tmp_path: Path):
+    storage = FileFeedbackStorage(tmp_path / "feedback")
+    record = FeedbackRecord(
+        feedback_id="def456",
+        prompt="Capital of France?",
+        response="Lyon",
+        is_correct=False,
+        correction="Paris",
+    )
+    storage.save(record)
+    loaded = storage.get("def456")
+    assert loaded is not None
+    assert loaded.feedback_id == "def456"
+    assert loaded.is_correct is False
+    assert loaded.correction == "Paris"
+    assert storage.get("missing") is None
+
+
+def test_create_feedback_storage_sqlite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db_path = str(tmp_path / "custom.db")
+    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "sqlite")
+    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", db_path)
+    storage = create_feedback_storage()
+    assert isinstance(storage, SqliteFeedbackStorage)
+    storage.save(
+        FeedbackRecord(
+            feedback_id="id1",
+            prompt="p",
+            response="r",
+            is_correct=True,
+        )
+    )
+    assert storage.get("id1") is not None
+
+
+def test_create_feedback_storage_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    dir_path = str(tmp_path / "json_feedback")
+    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "file")
+    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", dir_path)
+    storage = create_feedback_storage()
+    assert isinstance(storage, FileFeedbackStorage)
+    storage.save(
+        FeedbackRecord(
+            feedback_id="id2",
+            prompt="p",
+            response="r",
+            is_correct=False,
+            correction="fixed",
+        )
+    )
+    assert storage.get("id2") is not None
+
+
+def test_create_feedback_storage_unknown_backend():
+    with pytest.raises(ValueError, match="Unknown FEEDBACK_STORAGE_BACKEND"):
+        create_feedback_storage(backend="redis")
+
+
+# --- API tests (isolated temp storage per module) ---
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    """
-    Provide a TestClient backed by an isolated feedback store so tests
-    do not touch the default data/ directory.
-    """
-    store_path = tmp_path / "feedback.jsonl"
-    monkeypatch.setenv("FEEDBACK_STORE_PATH", str(store_path))
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """App TestClient backed by a fresh SQLite store in tmp_path."""
+    db_path = str(tmp_path / "test_feedback.db")
+    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "sqlite")
+    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", db_path)
 
-    # Re-import after env override so FEEDBACK_STORE_PATH is set for this test.
-    import importlib
+    # Re-import / rebind storage after env is set so the app uses temp DB.
     import src.main as main_module
+    from src.storage import create_feedback_storage as factory
 
-    importlib.reload(main_module)
-    main_module.FEEDBACK_STORE_PATH = Path(store_path)
-
-    with TestClient(main_module.app) as test_client:
-        yield test_client, main_module, store_path
+    main_module.feedback_storage = factory()
+    return TestClient(main_module.app)
 
 
-def test_read_root(client):
+@pytest.fixture
+def file_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """App TestClient backed by a file (JSON) store in tmp_path."""
+    dir_path = str(tmp_path / "feedback_files")
+    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "file")
+    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", dir_path)
+
+    import src.main as main_module
+    from src.storage import create_feedback_storage as factory
+
+    main_module.feedback_storage = factory()
+    return TestClient(main_module.app)
+
+
+def test_read_root(client: TestClient):
     """
     Test the health check endpoint.
     """
-    test_client, _, _ = client
-    response = test_client.get("/")
+    response = client.get("/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_feedback_endpoint(client):
+def test_feedback_endpoint_persists_and_retrieves(client: TestClient):
     """
-    Test the /api/feedback endpoint accepts valid feedback and returns an id.
+    POST /api/feedback stores the record; GET /api/feedback/{id} returns it.
     """
-    test_client, _, _ = client
     feedback_data = {
         "prompt": "What is the capital of France?",
         "response": "Paris",
         "is_correct": True,
     }
-    response = test_client.post("/api/feedback", json=feedback_data)
+    response = client.post("/api/feedback", json=feedback_data)
 
     assert response.status_code == 200
     json_response = response.json()
     assert "message" in json_response
     assert "feedback_id" in json_response
     assert json_response["message"] == "Feedback received successfully. Thank you!"
+    feedback_id = json_response["feedback_id"]
+    assert feedback_id
+
+    get_response = client.get(f"/api/feedback/{feedback_id}")
+    assert get_response.status_code == 200
+    detail = get_response.json()
+    assert detail["feedback_id"] == feedback_id
+    assert detail["prompt"] == feedback_data["prompt"]
+    assert detail["response"] == feedback_data["response"]
+    assert detail["is_correct"] is True
+    assert detail["correction"] is None
 
 
-def test_feedback_is_persisted(client):
-    """
-    Feedback must be written to durable storage, not only printed.
-    """
-    test_client, main_module, store_path = client
+def test_feedback_with_correction(client: TestClient):
     feedback_data = {
-        "prompt": "Write a hello world function",
-        "response": "def hello(): print('hi')",
+        "prompt": "What is 2+2?",
+        "response": "5",
         "is_correct": False,
-        "correction": "def hello(): print('hello world')",
+        "correction": "4",
     }
-    response = test_client.post("/api/feedback", json=feedback_data)
+    response = client.post("/api/feedback", json=feedback_data)
     assert response.status_code == 200
     feedback_id = response.json()["feedback_id"]
 
-    assert store_path.exists(), "feedback store file should be created"
-    stored = main_module.load_feedback(feedback_id)
-    assert stored is not None, "feedback record must be loadable by id"
-    assert stored["feedback_id"] == feedback_id
-    assert stored["prompt"] == feedback_data["prompt"]
-    assert stored["response"] == feedback_data["response"]
-    assert stored["is_correct"] is False
-    assert stored["correction"] == feedback_data["correction"]
+    detail = client.get(f"/api/feedback/{feedback_id}").json()
+    assert detail["is_correct"] is False
+    assert detail["correction"] == "4"
 
 
-def test_feedback_persistence_survives_reload(client):
-    """
-    Persisted feedback remains available after reloading the module (new process).
-    """
-    test_client, main_module, store_path = client
+def test_get_feedback_not_found(client: TestClient):
+    response = client.get("/api/feedback/does-not-exist")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Feedback not found"
+
+
+def test_feedback_file_backend_roundtrip(file_client: TestClient):
+    """Same API flow works with the file storage backend."""
     feedback_data = {
-        "prompt": "2+2?",
-        "response": "4",
+        "prompt": "Hello?",
+        "response": "Hi!",
         "is_correct": True,
     }
-    response = test_client.post("/api/feedback", json=feedback_data)
+    response = file_client.post("/api/feedback", json=feedback_data)
+    assert response.status_code == 200
     feedback_id = response.json()["feedback_id"]
 
-    # Simulate a new process reading the same store path.
-    reloaded = main_module.load_feedback(feedback_id, path=store_path)
-    assert reloaded is not None
-    assert reloaded["prompt"] == "2+2?"
-    assert reloaded["is_correct"] is True
+    detail = file_client.get(f"/api/feedback/{feedback_id}").json()
+    assert detail["prompt"] == "Hello?"
+    assert detail["response"] == "Hi!"
 
 
 # Note: Testing the /api/generate endpoint would require mocking the ollama library,

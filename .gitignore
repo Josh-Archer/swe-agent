@@ -97,7 +97,7 @@ ENV/
 env.bak/
 venv.bak/
 
-# Runtime feedback store (override path with FEEDBACK_STORE_PATH)
+# Local feedback storage data
 data/
 
 # Spyder project settings
