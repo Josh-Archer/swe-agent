@@ -28,15 +28,12 @@ spec:
         # If running Ollama in the same cluster, you can use its service name.
         - name: OLLAMA_HOST
           value: "http://ollama-service:11434"
-        # Durable feedback storage (SQLite on the mounted volume)
-        - name: FEEDBACK_STORAGE_BACKEND
-          value: "sqlite"
-        - name: FEEDBACK_STORAGE_PATH
-          value: "/app/data/feedback.db"
-        volumeMounts:
-        - name: feedback-data
-          mountPath: /app/data
-      volumes:
-      - name: feedback-data
-        persistentVolumeClaim:
-          claimName: ai-agent-data
+        # Optional API authentication. Leave unset to rely on ClusterIP + NetworkPolicy.
+        # Create the secret with:
+        #   kubectl create secret generic ai-agent-secrets --from-literal=api-key='YOUR_KEY'
+        # Then uncomment:
+        # - name: API_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: ai-agent-secrets
+        #       key: api-key
