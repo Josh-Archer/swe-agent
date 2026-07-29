@@ -43,7 +43,13 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
 ## API Endpoints
 
 *   `POST /api/generate`: Takes a prompt and returns a response from the LLM.
-*   `POST /api/feedback`: Allows submitting feedback on the agent's responses to be used for future training.
+*   `POST /api/feedback`: Accepts feedback on the agent's responses and **persists** it to a local JSONL store for later training/review. Each submission returns a `feedback_id`.
+
+### Feedback storage
+
+Feedback records are appended to a JSON Lines file (one JSON object per line). By default the path is `data/feedback.jsonl`. Override it with the `FEEDBACK_STORE_PATH` environment variable (useful for tests or alternative mounts in Kubernetes).
+
+Each record includes: `feedback_id`, `prompt`, `response`, `is_correct`, and optional `correction`.
 
 ## Deployment
 
