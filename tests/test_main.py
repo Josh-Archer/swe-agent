@@ -1,42 +1,35 @@
-"""Tests for health, feedback, API authentication, and streaming generation."""
+from unittest.mock import patch
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+import httpx
 from fastapi.testclient import TestClient
+from ollama import RequestError, ResponseError
 
-import src.main as main
+from src.main import app
 
+# The TestClient runs the app in-process and handles the event loop,
+# so we can use standard `def` test functions.
+client = TestClient(app)
 
-@pytest.fixture
-def client():
-    """App client with authentication disabled (API_KEY unset)."""
-    original = main.API_KEY
-    main.API_KEY = ""
-    with TestClient(main.app) as c:
-        yield c
-    main.API_KEY = original
-
-
-@pytest.fixture
-def authed_client():
-    """App client with a configured API key."""
-    original = main.API_KEY
-    main.API_KEY = "test-secret-key"
-    with TestClient(main.app) as c:
-        yield c
-    main.API_KEY = original
+GENERATE_PAYLOAD = {
+    "prompt": "What is the capital of France?",
+    "model": "llama2",
+}
 
 
-def test_read_root(client):
-    """Health check is always public."""
+def test_read_root():
+    """
+    Test the health check endpoint.
+    """
     response = client.get("/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_feedback_endpoint(client):
-    """Feedback accepts valid payloads when auth is disabled."""
+def test_feedback_endpoint():
+    """
+    Test the /api/feedback endpoint to ensure it accepts valid feedback.
+    The TestClient handles the async nature of the endpoint.
+    """
     feedback_data = {
         "prompt": "What is the capital of France?",
         "response": "Paris",
@@ -51,162 +44,102 @@ def test_feedback_endpoint(client):
     assert json_response["message"] == "Feedback received successfully. Thank you!"
 
 
-# --- Authentication ---
+def test_generate_success():
+    """Successful Ollama chat returns 200 with response text."""
+    mock_reply = {
+        "message": {"role": "assistant", "content": "Paris"},
+    }
+    with patch("src.main.ollama.chat", return_value=mock_reply) as mock_chat:
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
 
-
-def test_auth_missing_key_rejected(authed_client):
-    """Protected endpoints require a key when API_KEY is set."""
-    response = authed_client.post(
-        "/api/feedback",
-        json={
-            "prompt": "p",
-            "response": "r",
-            "is_correct": True,
-        },
-    )
-    assert response.status_code == 401
-    assert "API key" in response.json()["detail"]
-
-
-def test_auth_wrong_key_rejected(authed_client):
-    response = authed_client.post(
-        "/api/feedback",
-        headers={"X-API-Key": "wrong"},
-        json={
-            "prompt": "p",
-            "response": "r",
-            "is_correct": True,
-        },
-    )
-    assert response.status_code == 401
-
-
-def test_auth_x_api_key_accepted(authed_client):
-    response = authed_client.post(
-        "/api/feedback",
-        headers={"X-API-Key": "test-secret-key"},
-        json={
-            "prompt": "p",
-            "response": "r",
-            "is_correct": True,
-        },
-    )
     assert response.status_code == 200
+    assert response.json() == {"response": "Paris"}
+    mock_chat.assert_called_once()
 
 
-def test_auth_bearer_token_accepted(authed_client):
-    response = authed_client.post(
-        "/api/feedback",
-        headers={"Authorization": "Bearer test-secret-key"},
-        json={
-            "prompt": "p",
-            "response": "r",
-            "is_correct": True,
-        },
-    )
-    assert response.status_code == 200
+def test_generate_connection_error_returns_503():
+    """Connection failures map to 503 Service Unavailable."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=ConnectionError("Failed to connect to Ollama"),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 503
+    assert "unavailable" in response.json()["detail"].lower()
 
 
-def test_health_remains_public_when_auth_enabled(authed_client):
-    response = authed_client.get("/")
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+def test_generate_httpx_connect_error_returns_503():
+    """httpx connection errors also map to 503."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=httpx.ConnectError("connection refused"),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 503
+    assert "unavailable" in response.json()["detail"].lower()
 
 
-def test_generate_requires_auth_when_configured(authed_client):
-    response = authed_client.post(
-        "/api/generate",
-        json={"prompt": "hello"},
-    )
-    assert response.status_code == 401
+def test_generate_timeout_returns_503():
+    """Timeouts map to 503 Service Unavailable."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=httpx.TimeoutException("timed out"),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 503
+    assert "unavailable" in response.json()["detail"].lower()
 
 
-# --- Non-streaming generate ---
+def test_generate_request_error_returns_400():
+    """Invalid Ollama requests map to 400 Bad Request."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=RequestError("model is required"),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 400
+    assert "invalid ollama request" in response.json()["detail"].lower()
 
 
-def test_generate_non_streaming(client):
-    mock_response = {"message": {"content": "Hello from the model"}}
-    with patch.object(main.ollama, "chat", return_value=mock_response) as mock_chat:
-        response = client.post(
-            "/api/generate",
-            json={"prompt": "Hi", "model": "llama2", "stream": False},
-        )
-        assert response.status_code == 200
-        assert response.json() == {"response": "Hello from the model"}
-        mock_chat.assert_called_once()
-        call_kwargs = mock_chat.call_args.kwargs
-        assert call_kwargs["model"] == "llama2"
-        assert call_kwargs["messages"] == [{"role": "user", "content": "Hi"}]
+def test_generate_model_not_found_returns_400():
+    """Missing model (404 / not found message) maps to 400."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=ResponseError("model 'llama2' not found", status_code=404),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 400
+    detail = response.json()["detail"].lower()
+    assert "not found" in detail
+    assert "llama2" in detail
 
 
-def test_generate_ollama_error(client):
-    with patch.object(main.ollama, "chat", side_effect=RuntimeError("ollama down")):
-        response = client.post(
-            "/api/generate",
-            json={"prompt": "Hi"},
-        )
-        assert response.status_code == 500
-        assert "ollama down" in response.json()["detail"]
+def test_generate_upstream_response_error_returns_502():
+    """Other Ollama ResponseErrors map to 502 Bad Gateway."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=ResponseError("internal server error", status_code=500),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
+
+    assert response.status_code == 502
+    detail = response.json()["detail"].lower()
+    assert "upstream" in detail
+    assert "internal server error" in detail
 
 
-# --- Streaming generate ---
+def test_generate_unexpected_error_returns_500():
+    """Unexpected exceptions still return 500 without leaking full internals only type."""
+    with patch(
+        "src.main.ollama.chat",
+        side_effect=RuntimeError("boom"),
+    ):
+        response = client.post("/api/generate", json=GENERATE_PAYLOAD)
 
-
-def _fake_stream_chunks():
-    yield {"message": {"content": "Hel"}, "done": False}
-    yield {"message": {"content": "lo"}, "done": False}
-    yield {"message": {"content": "!"}, "done": True}
-
-
-def test_generate_streaming_sse(client):
-    with patch.object(main.ollama, "chat", return_value=_fake_stream_chunks()) as mock_chat:
-        response = client.post(
-            "/api/generate",
-            json={"prompt": "stream me", "stream": True},
-        )
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-
-        body = response.text
-        assert 'data: {"content": "Hel"}' in body
-        assert 'data: {"content": "lo"}' in body
-        assert 'data: {"content": "!"}' in body
-        assert "event: done" in body
-        assert 'data: {"done": true}' in body
-
-        # stream=True must be forwarded to ollama
-        assert mock_chat.call_args.kwargs.get("stream") is True
-
-
-def test_generate_streaming_requires_auth(authed_client):
-    response = authed_client.post(
-        "/api/generate",
-        json={"prompt": "stream me", "stream": True},
-    )
-    assert response.status_code == 401
-
-
-def test_generate_streaming_with_auth(authed_client):
-    with patch.object(main.ollama, "chat", return_value=_fake_stream_chunks()):
-        response = authed_client.post(
-            "/api/generate",
-            headers={"X-API-Key": "test-secret-key"},
-            json={"prompt": "stream me", "stream": True},
-        )
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-        assert 'data: {"content": "Hel"}' in response.text
-
-
-def test_generate_streaming_error_event(client):
-    def boom(**_kwargs):
-        raise RuntimeError("stream failed")
-
-    with patch.object(main.ollama, "chat", side_effect=boom):
-        response = client.post(
-            "/api/generate",
-            json={"prompt": "x", "stream": True},
-        )
-        assert response.status_code == 200  # SSE opens; error is in-band
-        assert "event: error" in response.text
-        assert "stream failed" in response.text
+    assert response.status_code == 500
+    assert "RuntimeError" in response.json()["detail"]

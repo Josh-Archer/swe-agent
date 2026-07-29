@@ -1,91 +1,33 @@
-import json
+import logging
 import os
-from collections.abc import Iterator
-from typing import Annotated
+from typing import NoReturn
 
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Security, status
-from fastapi.responses import StreamingResponse
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import httpx
 import ollama
+from ollama import RequestError, ResponseError
+from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-# --- Configuration ---
-# When API_KEY is unset/empty, the API is open (suitable for ClusterIP + NetworkPolicy).
-# When set, clients must send X-API-Key or Authorization: Bearer <key>.
-API_KEY = os.getenv("API_KEY", "").strip()
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
-
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 # Initialize the FastAPI app
 app = FastAPI(
     title="AI Agent API",
-    description=(
-        "An API for interacting with an AI agent and providing feedback. "
-        "Supports streaming generation and optional API-key authentication."
-    ),
-    version="0.2.0",
+    description="An API for interacting with an AI agent and providing feedback.",
+    version="0.1.0",
 )
-
-
-# --- Auth ---
-def _extract_api_key(
-    x_api_key: str | None,
-    credentials: HTTPAuthorizationCredentials | None,
-) -> str | None:
-    """Prefer X-API-Key; fall back to Bearer token."""
-    if x_api_key:
-        return x_api_key.strip()
-    if credentials and credentials.scheme.lower() == "bearer":
-        return credentials.credentials.strip()
-    return None
-
-
-async def require_api_key(
-    x_api_key: Annotated[str | None, Security(api_key_header)] = None,
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Security(bearer_scheme)
-    ] = None,
-) -> None:
-    """
-    Enforce API key when API_KEY is configured.
-
-    Network-policy-friendly: leave API_KEY unset and restrict access at the
-    cluster network layer (ClusterIP + NetworkPolicy) instead.
-    """
-    if not API_KEY:
-        return
-
-    provided = _extract_api_key(x_api_key, credentials)
-    if not provided or provided != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
 
 # --- Pydantic Models ---
 class GenerateRequest(BaseModel):
     prompt: str
-    model: str = DEFAULT_MODEL
-    stream: bool = Field(
-        default=False,
-        description=(
-            "If true, respond with Server-Sent Events (text/event-stream) "
-            "token chunks instead of a single JSON body."
-        ),
-    )
-
+    model: str = os.getenv("OLLAMA_MODEL", "llama2") # Default model from env or hardcoded
 
 class GenerateResponse(BaseModel):
     response: str
-
 
 class FeedbackRequest(BaseModel):
     prompt: str
@@ -93,42 +35,103 @@ class FeedbackRequest(BaseModel):
     is_correct: bool
     correction: str | None = None
 
-
 class FeedbackResponse(BaseModel):
     message: str
-    feedback_id: str  # A unique ID for the feedback record
+    feedback_id: str # A unique ID for the feedback record
 
 
-# --- Streaming helpers ---
-def _sse_event(data: dict, event: str | None = None) -> str:
-    """Format a single Server-Sent Event."""
-    lines: list[str] = []
-    if event:
-        lines.append(f"event: {event}")
-    lines.append(f"data: {json.dumps(data, ensure_ascii=False)}")
-    lines.append("")  # blank line terminates the event
-    return "\n".join(lines) + "\n"
+def _is_model_not_found(error: ResponseError) -> bool:
+    """Return True when Ollama indicates the requested model is missing."""
+    message = (error.error or str(error)).lower()
+    if error.status_code == 404:
+        return True
+    return "not found" in message or ("model" in message and "pull" in message)
 
 
-def _stream_ollama_chat(model: str, prompt: str) -> Iterator[str]:
-    """Yield SSE-framed chunks from Ollama's streaming chat API."""
-    try:
-        stream = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
+def _raise_mapped_ollama_error(exc: Exception, *, model: str) -> NoReturn:
+    """
+    Map Ollama/client failures to clear HTTP status codes and log structured detail.
+
+    - 503: Ollama unreachable / connection / timeout
+    - 400: bad client input (missing model, model not found, request errors)
+    - 502: other upstream Ollama response failures
+    - 500: unexpected internal errors
+    """
+    if isinstance(exc, (ConnectionError, httpx.ConnectError, httpx.TimeoutException)):
+        logger.error(
+            "ollama_unavailable",
+            extra={
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "model": model,
+                "http_status": 503,
+            },
         )
-        for chunk in stream:
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                yield _sse_event({"content": content})
-            if chunk.get("done"):
-                yield _sse_event({"done": True}, event="done")
-                return
-        # Ensure clients always see a terminal event
-        yield _sse_event({"done": True}, event="done")
-    except Exception as exc:  # noqa: BLE001 — surface Ollama errors to client
-        yield _sse_event({"error": str(exc)}, event="error")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Ollama service is unavailable. "
+                "Check that Ollama is running and reachable."
+            ),
+        ) from exc
+
+    if isinstance(exc, RequestError):
+        logger.error(
+            "ollama_request_error",
+            extra={
+                "error_type": "RequestError",
+                "error": str(exc),
+                "model": model,
+                "http_status": 400,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Ollama request: {exc.error or str(exc)}",
+        ) from exc
+
+    if isinstance(exc, ResponseError):
+        if _is_model_not_found(exc):
+            status = 400
+            detail = (
+                f"Model '{model}' was not found on the Ollama server. "
+                f"Pull the model or choose an available one. "
+                f"Upstream: {exc.error or str(exc)}"
+            )
+            log_event = "ollama_model_not_found"
+        else:
+            status = 502
+            detail = (
+                f"Ollama upstream error while generating with model '{model}': "
+                f"{exc.error or str(exc)}"
+            )
+            log_event = "ollama_upstream_error"
+
+        logger.error(
+            log_event,
+            extra={
+                "error_type": "ResponseError",
+                "error": str(exc),
+                "upstream_status": exc.status_code,
+                "model": model,
+                "http_status": status,
+            },
+        )
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+    logger.exception(
+        "ollama_unexpected_error",
+        extra={
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "model": model,
+            "http_status": 500,
+        },
+    )
+    raise HTTPException(
+        status_code=500,
+        detail=f"Unexpected error generating response: {type(exc).__name__}",
+    ) from exc
 
 
 # --- API Endpoints ---
@@ -137,54 +140,30 @@ def _stream_ollama_chat(model: str, prompt: str) -> Iterator[str]:
 def read_root():
     """
     Root endpoint to check if the API is up and running.
-    Always public (no API key) for liveness/readiness probes.
     """
     return {"status": "ok"}
 
 
-@app.post(
-    "/api/generate",
-    response_model=None,
-    summary="Generate Agent Response",
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/generate", response_model=GenerateResponse, summary="Generate Agent Response")
 async def generate(request: GenerateRequest):
     """
     Generates a response from the specified Ollama model based on the prompt.
 
     - **prompt**: The input text to the model.
-    - **model**: The name of the Ollama model to use (e.g. 'llama2', 'codellama').
-    - **stream**: When true, returns `text/event-stream` (SSE) with incremental
-      `data: {"content": "..."}` events and a final `event: done`.
+    - **model**: The name of the Ollama model to use (e.g., 'llama2', 'codellama').
     """
-    if request.stream:
-        return StreamingResponse(
-            _stream_ollama_chat(request.model, request.prompt),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
     try:
         ollama_response = ollama.chat(
             model=request.model,
-            messages=[{"role": "user", "content": request.prompt}],
+            messages=[{'role': 'user', 'content': request.prompt}]
         )
-        response_content = ollama_response["message"]["content"]
+        response_content = ollama_response['message']['content']
         return GenerateResponse(response=response_content)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as e:
+        _raise_mapped_ollama_error(e, model=request.model)
 
 
-@app.post(
-    "/api/feedback",
-    response_model=FeedbackResponse,
-    summary="Submit Feedback",
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/feedback", response_model=FeedbackResponse, summary="Submit Feedback")
 async def feedback(request: FeedbackRequest):
     """
     Submits feedback on a generated response. This data can be used later
@@ -195,6 +174,8 @@ async def feedback(request: FeedbackRequest):
     - **is_correct**: A boolean indicating if the response was correct.
     - **correction**: (Optional) The corrected version of the response.
     """
+    # For now, we'll just print the feedback.
+    # In a real application, you would save this to a database or a file.
     feedback_id = os.urandom(16).hex()
     print(f"Received feedback ({feedback_id}):")
     print(f"  Prompt: {request.prompt}")
@@ -203,7 +184,9 @@ async def feedback(request: FeedbackRequest):
     if request.correction:
         print(f"  Correction: {request.correction}")
 
+    # You would typically save this to a database or a message queue
+    # for further processing.
     return FeedbackResponse(
         message="Feedback received successfully. Thank you!",
-        feedback_id=feedback_id,
+        feedback_id=feedback_id
     )

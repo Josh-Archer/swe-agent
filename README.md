@@ -146,6 +146,19 @@ curl -sS -X POST "http://127.0.0.1:8000/api/feedback" \
   }'
 ```
 
+### Generate error responses
+
+`/api/generate` maps Ollama failures to clear HTTP status codes (instead of opaque 500s):
+
+| Status | When |
+|--------|------|
+| **400** | Invalid request or model not found on the Ollama server |
+| **502** | Ollama returned an upstream error |
+| **503** | Ollama is unreachable (connection failure / timeout) |
+| **500** | Unexpected internal error |
+
+Errors are also written as structured log records (`error_type`, `model`, `http_status`, etc.).
+
 ## Deployment
 
 1.  **Apply the Kubernetes manifests:**
