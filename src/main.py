@@ -105,6 +105,26 @@ def read_root():
 
 
 @app.get(
+    "/ready",
+    summary="Readiness Check",
+    description="Confirm the configured Ollama model is available.",
+)
+def ready():
+    """
+    Readiness probe: verify the configured Ollama model has been pulled.
+    """
+    model = os.getenv("OLLAMA_MODEL", "llama2")
+    try:
+        ollama.show(model)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model {model!r} is not available: {exc}",
+        ) from exc
+    return {"status": "ready", "model": model}
+
+
+@app.get(
     "/api/tools",
     response_model=ToolsInfoResponse,
     summary="List agent tools and sandbox safety defaults",
