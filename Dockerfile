@@ -19,5 +19,11 @@ EXPOSE 8000
 # Define environment variable for the default model
 ENV OLLAMA_MODEL="llama2"
 
+# Default durable feedback storage (mount a volume at /app/data in production)
+ENV FEEDBACK_STORAGE_BACKEND="sqlite"
+ENV FEEDBACK_STORAGE_PATH="/app/data/feedback.db"
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
 # Run the application when the container launches
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
