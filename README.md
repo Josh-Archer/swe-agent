@@ -1,12 +1,13 @@
 # K3s Deployable AI Agent
 
-This project provides a template for creating a k3s-deployable AI agent that wraps a local or remote Large Language Model (LLM). It includes a feedback mechanism to allow for fine-tuning and improvement of the agent's coding abilities.
+This project provides a template for creating a k3s-deployable AI agent that wraps a local or remote Large Language Model (LLM). It includes a feedback mechanism to allow for fine-tuning and improvement of the agent's coding abilities, plus a **tool-using agent loop** that can checkout code, run tests, and produce patches inside an isolated sandbox.
 
 ## Features
 
 *   **FastAPI Backend**: A Python-based backend using FastAPI to serve the agent's API.
 *   **Ollama Integration**: Pre-configured to connect to an Ollama instance for LLM inference.
-*   **Readiness checks**: Kubernetes readiness/startup probes verify the configured model is pulled before the agent receives traffic.
+*   **Tool-using agent loop**: Sandboxed `run_command`, `read_file`, and `write_file` tools with an iterative resolve flow (checkout → edit → test → patch).
+*   **Issue resolution API**: Synchronous or background job mode via `POST /api/resolve`.
 *   **Dockerized**: Comes with a `Dockerfile` for easy containerization.
 *   **Kubernetes Ready**: Includes k3s-compatible deployment and service manifests.
 *   **GitHub Actions CI/CD**: An automated workflow to test the application, build, and push the Docker image to a container registry.
@@ -41,100 +42,104 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
     ```
     The application will be available at `http://127.0.0.1:8000`.
 
-    Ensure Ollama is running and the model is pulled (see [Pre-pulling models](#pre-pulling-models)). Set `OLLAMA_HOST` if Ollama is not on the default URL.
+3.  **Run tests:**
+    ```bash
+    pytest
+    ```
 
 ## API Endpoints
 
-*   `GET /`: Liveness check (process is up; does not require the model).
-*   `GET /ready`: Readiness check (returns 200 only when `OLLAMA_MODEL` is available on Ollama; 503 otherwise).
+*   `GET /`: Health check.
+*   `GET /api/tools`: List the minimal tool interface and sandbox safety notes.
 *   `POST /api/generate`: Takes a prompt and returns a response from the LLM.
 *   `POST /api/feedback`: Allows submitting feedback on the agent's responses to be used for future training.
+*   `POST /api/resolve`: Run the tool-using agent loop against an issue (sync or async job).
+*   `GET /api/jobs`: List in-memory resolve jobs.
+*   `GET /api/jobs/{job_id}`: Fetch status/result for a resolve job.
+
+### Resolve example
+
+Synchronous (waits for the agent to finish):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/resolve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "issue": "Add a function add(a, b) in mathutil.py and make a simple test pass",
+    "max_steps": 10,
+    "test_command": "pytest",
+    "async_mode": false
+  }'
+```
+
+Background job mode:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"issue":"Fix the failing unit test","repo_url":"https://github.com/example/repo.git","async_mode":true}'
+
+# then poll
+curl -s http://127.0.0.1:8000/api/jobs/<job_id>
+```
+
+Optional body fields: `repo_url`, `git_ref`, `max_steps`, `test_command`, `model`, `async_mode`.
+
+## Tool-using agent loop
+
+The resolve flow:
+
+1. Create a **sandbox workspace** (temp dir under the sandbox root; optional `git clone` of `repo_url`).
+2. Establish a git baseline so later changes can be exported as a patch.
+3. Loop (up to `max_steps`): ask the LLM for the next JSON action → execute a tool → feed the observation back.
+4. On `finish` (or max steps), collect `git diff` and return status, summary, step log, and patch.
+
+### Minimal tool interface
+
+| Tool | Purpose |
+|------|---------|
+| `run_command` | Run a shell command with `cwd` = workspace and a hard timeout |
+| `read_file` | Read a UTF-8 text file **inside** the workspace |
+| `write_file` | Create/overwrite a UTF-8 text file **inside** the workspace |
+
+Path arguments are confined to the workspace; `../` traversal is rejected.
+
+## Sandbox & safety defaults
+
+**There is no host mount by default.** Workspaces are created under:
+
+* `AGENT_SANDBOX_ROOT` if set, otherwise
+* `<system temp>/swe-agent-sandboxes/`
+
+Important environment variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AGENT_SANDBOX_ROOT` | system temp subdir | Root directory for all agent workspaces |
+| `AGENT_ALLOW_HOST_MOUNT` | `false` | If `true`, allow binding an arbitrary host path as a workspace |
+| `AGENT_COMMAND_TIMEOUT` | `60` | Default command timeout (seconds) |
+| `AGENT_MAX_OUTPUT_BYTES` | `262144` | Truncate tool stdout/stderr to this many bytes |
+| `OLLAMA_MODEL` / `OLLAMA_HOST` | `llama2` / ollama default | LLM configuration |
+
+### Sandbox notes (read carefully)
+
+* Isolation is **application-level** (path confinement + timeouts + minimal env). It is **not** a full OS sandbox (no seccomp/user namespaces by itself).
+* Prefer deploying the agent **in Kubernetes without `hostPath` volumes** so the container filesystem boundary is the primary isolation layer.
+* Do **not** set `AGENT_ALLOW_HOST_MOUNT=true` in shared/multi-tenant environments.
+* Child processes inherit a reduced environment and set `SWE_AGENT_SANDBOX=1`.
+* The in-memory job store is for single-replica demos; replace with a durable queue for production.
 
 ## Deployment
 
 1.  **Apply the Kubernetes manifests:**
     ```bash
-    kubectl apply -f k8s/ollama-deployment.yaml
-    kubectl apply -f k8s/deployment.yaml
-    kubectl apply -f k8s/service.yaml
+    kubectl apply -f k8s/
     ```
 
-2.  **Pre-pull the Ollama model** (required before the agent becomes Ready):
-    ```bash
-    kubectl apply -f k8s/ollama-model-pull-job.yaml
-    ```
-    Or pull manually:
-    ```bash
-    kubectl exec -it deployment/ollama-deployment -- ollama pull llama2
-    ```
-    Keep the model name in sync with `OLLAMA_MODEL` in `k8s/deployment.yaml` and the pull Job.
-
-3.  **Verify the deployment:**
+2.  **Verify the deployment:**
     ```bash
     kubectl get pods
     kubectl get services
-    kubectl get job ollama-model-pull
     ```
-    The AI agent pod remains `0/1 Ready` until `/ready` succeeds (model is present).
 
-### Health probes
-
-| Probe    | Path    | Purpose |
-|----------|---------|---------|
-| Liveness | `GET /` | Restart the container if the process is dead. Independent of Ollama. |
-| Startup  | `GET /ready` | Delay readiness until the model is pulled (long failure window). |
-| Readiness| `GET /ready` | Stop traffic if the model disappears or Ollama becomes unreachable. |
-
-## Pre-pulling models
-
-Ollama starts without any models. If the agent is marked Ready before the model exists, the first `/api/generate` call fails. This project avoids that by:
-
-1. **Agent `/ready` endpoint** – calls `ollama.show(OLLAMA_MODEL)` and returns 503 until the model exists.
-2. **Kubernetes probes** – `startupProbe` and `readinessProbe` hit `/ready` on the agent Deployment.
-3. **Pull Job** – `k8s/ollama-model-pull-job.yaml` pulls the model into the Ollama service.
-
-### Recommended cluster workflow
-
-```bash
-# 1. Start Ollama
-kubectl apply -f k8s/ollama-deployment.yaml
-
-# 2. Wait until Ollama is Ready
-kubectl wait --for=condition=available deployment/ollama-deployment --timeout=120s
-
-# 3. Pull the model (must match OLLAMA_MODEL on the agent)
-kubectl apply -f k8s/ollama-model-pull-job.yaml
-kubectl wait --for=condition=complete job/ollama-model-pull --timeout=600s
-
-# 4. Deploy the agent (probes will pass once the model is listed)
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-```
-
-### Local Ollama
-
-```bash
-ollama pull llama2
-export OLLAMA_MODEL=llama2
-# optional if not default:
-# export OLLAMA_HOST=http://127.0.0.1:11434
-uvicorn src.main:app --reload
-curl http://127.0.0.1:8000/ready
-```
-
-### Changing the model
-
-Update **all** of the following to the same name:
-
-* `OLLAMA_MODEL` env in `k8s/deployment.yaml`
-* `OLLAMA_MODEL` env in `k8s/ollama-model-pull-job.yaml`
-* `ENV OLLAMA_MODEL` in the `Dockerfile` (image default)
-
-Then re-run the pull Job (delete the old Job first if it already completed):
-
-```bash
-kubectl delete job ollama-model-pull --ignore-not-found
-kubectl apply -f k8s/ollama-model-pull-job.yaml
-```
-
-For durable model storage across Ollama pod restarts, replace the `emptyDir` volume in `k8s/ollama-deployment.yaml` with a `PersistentVolumeClaim`.
+The sample `k8s/deployment.yaml` does **not** mount host paths into the agent container, matching the safety default of no host mount.
