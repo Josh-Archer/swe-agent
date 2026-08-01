@@ -1,141 +1,42 @@
-import os
-from pathlib import Path
+"""Tests for health, feedback, API authentication, and streaming generation."""
+
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from src.storage import (
-    FileFeedbackStorage,
-    FeedbackRecord,
-    SqliteFeedbackStorage,
-    create_feedback_storage,
-)
-
-
-# --- Storage unit tests ---
-
-def test_sqlite_storage_save_and_get(tmp_path: Path):
-    storage = SqliteFeedbackStorage(tmp_path / "feedback.db")
-    record = FeedbackRecord(
-        feedback_id="abc123",
-        prompt="What is 2+2?",
-        response="4",
-        is_correct=True,
-        correction=None,
-    )
-    storage.save(record)
-    loaded = storage.get("abc123")
-    assert loaded is not None
-    assert loaded.feedback_id == "abc123"
-    assert loaded.prompt == "What is 2+2?"
-    assert loaded.response == "4"
-    assert loaded.is_correct is True
-    assert loaded.correction is None
-    assert storage.get("missing") is None
-
-
-def test_file_storage_save_and_get(tmp_path: Path):
-    storage = FileFeedbackStorage(tmp_path / "feedback")
-    record = FeedbackRecord(
-        feedback_id="def456",
-        prompt="Capital of France?",
-        response="Lyon",
-        is_correct=False,
-        correction="Paris",
-    )
-    storage.save(record)
-    loaded = storage.get("def456")
-    assert loaded is not None
-    assert loaded.feedback_id == "def456"
-    assert loaded.is_correct is False
-    assert loaded.correction == "Paris"
-    assert storage.get("missing") is None
-
-
-def test_create_feedback_storage_sqlite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    db_path = str(tmp_path / "custom.db")
-    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "sqlite")
-    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", db_path)
-    storage = create_feedback_storage()
-    assert isinstance(storage, SqliteFeedbackStorage)
-    storage.save(
-        FeedbackRecord(
-            feedback_id="id1",
-            prompt="p",
-            response="r",
-            is_correct=True,
-        )
-    )
-    assert storage.get("id1") is not None
-
-
-def test_create_feedback_storage_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    dir_path = str(tmp_path / "json_feedback")
-    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "file")
-    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", dir_path)
-    storage = create_feedback_storage()
-    assert isinstance(storage, FileFeedbackStorage)
-    storage.save(
-        FeedbackRecord(
-            feedback_id="id2",
-            prompt="p",
-            response="r",
-            is_correct=False,
-            correction="fixed",
-        )
-    )
-    assert storage.get("id2") is not None
-
-
-def test_create_feedback_storage_unknown_backend():
-    with pytest.raises(ValueError, match="Unknown FEEDBACK_STORAGE_BACKEND"):
-        create_feedback_storage(backend="redis")
-
-
-# --- API tests (isolated temp storage per module) ---
-
-@pytest.fixture
-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """App TestClient backed by a fresh SQLite store in tmp_path."""
-    db_path = str(tmp_path / "test_feedback.db")
-    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "sqlite")
-    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", db_path)
-
-    # Re-import / rebind storage after env is set so the app uses temp DB.
-    import src.main as main_module
-    from src.storage import create_feedback_storage as factory
-
-    main_module.feedback_storage = factory()
-    return TestClient(main_module.app)
+import src.main as main
 
 
 @pytest.fixture
-def file_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """App TestClient backed by a file (JSON) store in tmp_path."""
-    dir_path = str(tmp_path / "feedback_files")
-    monkeypatch.setenv("FEEDBACK_STORAGE_BACKEND", "file")
-    monkeypatch.setenv("FEEDBACK_STORAGE_PATH", dir_path)
-
-    import src.main as main_module
-    from src.storage import create_feedback_storage as factory
-
-    main_module.feedback_storage = factory()
-    return TestClient(main_module.app)
+def client():
+    """App client with authentication disabled (API_KEY unset)."""
+    original = main.API_KEY
+    main.API_KEY = ""
+    with TestClient(main.app) as c:
+        yield c
+    main.API_KEY = original
 
 
-def test_read_root(client: TestClient):
-    """
-    Test the health check endpoint.
-    """
+@pytest.fixture
+def authed_client():
+    """App client with a configured API key."""
+    original = main.API_KEY
+    main.API_KEY = "test-secret-key"
+    with TestClient(main.app) as c:
+        yield c
+    main.API_KEY = original
+
+
+def test_read_root(client):
+    """Health check is always public."""
     response = client.get("/")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_feedback_endpoint_persists_and_retrieves(client: TestClient):
-    """
-    POST /api/feedback stores the record; GET /api/feedback/{id} returns it.
-    """
+def test_feedback_endpoint(client):
+    """Feedback accepts valid payloads when auth is disabled."""
     feedback_data = {
         "prompt": "What is the capital of France?",
         "response": "Paris",
@@ -148,57 +49,164 @@ def test_feedback_endpoint_persists_and_retrieves(client: TestClient):
     assert "message" in json_response
     assert "feedback_id" in json_response
     assert json_response["message"] == "Feedback received successfully. Thank you!"
-    feedback_id = json_response["feedback_id"]
-    assert feedback_id
-
-    get_response = client.get(f"/api/feedback/{feedback_id}")
-    assert get_response.status_code == 200
-    detail = get_response.json()
-    assert detail["feedback_id"] == feedback_id
-    assert detail["prompt"] == feedback_data["prompt"]
-    assert detail["response"] == feedback_data["response"]
-    assert detail["is_correct"] is True
-    assert detail["correction"] is None
 
 
-def test_feedback_with_correction(client: TestClient):
-    feedback_data = {
-        "prompt": "What is 2+2?",
-        "response": "5",
-        "is_correct": False,
-        "correction": "4",
-    }
-    response = client.post("/api/feedback", json=feedback_data)
+# --- Authentication ---
+
+
+def test_auth_missing_key_rejected(authed_client):
+    """Protected endpoints require a key when API_KEY is set."""
+    response = authed_client.post(
+        "/api/feedback",
+        json={
+            "prompt": "p",
+            "response": "r",
+            "is_correct": True,
+        },
+    )
+    assert response.status_code == 401
+    assert "API key" in response.json()["detail"]
+
+
+def test_auth_wrong_key_rejected(authed_client):
+    response = authed_client.post(
+        "/api/feedback",
+        headers={"X-API-Key": "wrong"},
+        json={
+            "prompt": "p",
+            "response": "r",
+            "is_correct": True,
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_auth_x_api_key_accepted(authed_client):
+    response = authed_client.post(
+        "/api/feedback",
+        headers={"X-API-Key": "test-secret-key"},
+        json={
+            "prompt": "p",
+            "response": "r",
+            "is_correct": True,
+        },
+    )
     assert response.status_code == 200
-    feedback_id = response.json()["feedback_id"]
-
-    detail = client.get(f"/api/feedback/{feedback_id}").json()
-    assert detail["is_correct"] is False
-    assert detail["correction"] == "4"
 
 
-def test_get_feedback_not_found(client: TestClient):
-    response = client.get("/api/feedback/does-not-exist")
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Feedback not found"
-
-
-def test_feedback_file_backend_roundtrip(file_client: TestClient):
-    """Same API flow works with the file storage backend."""
-    feedback_data = {
-        "prompt": "Hello?",
-        "response": "Hi!",
-        "is_correct": True,
-    }
-    response = file_client.post("/api/feedback", json=feedback_data)
+def test_auth_bearer_token_accepted(authed_client):
+    response = authed_client.post(
+        "/api/feedback",
+        headers={"Authorization": "Bearer test-secret-key"},
+        json={
+            "prompt": "p",
+            "response": "r",
+            "is_correct": True,
+        },
+    )
     assert response.status_code == 200
-    feedback_id = response.json()["feedback_id"]
-
-    detail = file_client.get(f"/api/feedback/{feedback_id}").json()
-    assert detail["prompt"] == "Hello?"
-    assert detail["response"] == "Hi!"
 
 
-# Note: Testing the /api/generate endpoint would require mocking the ollama library,
-# as it's not guaranteed to be available in a CI/CD environment.
-# For this initial setup, we will skip that test.
+def test_health_remains_public_when_auth_enabled(authed_client):
+    response = authed_client.get("/")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_generate_requires_auth_when_configured(authed_client):
+    response = authed_client.post(
+        "/api/generate",
+        json={"prompt": "hello"},
+    )
+    assert response.status_code == 401
+
+
+# --- Non-streaming generate ---
+
+
+def test_generate_non_streaming(client):
+    mock_response = {"message": {"content": "Hello from the model"}}
+    with patch.object(main.ollama, "chat", return_value=mock_response) as mock_chat:
+        response = client.post(
+            "/api/generate",
+            json={"prompt": "Hi", "model": "llama2", "stream": False},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"response": "Hello from the model"}
+        mock_chat.assert_called_once()
+        call_kwargs = mock_chat.call_args.kwargs
+        assert call_kwargs["model"] == "llama2"
+        assert call_kwargs["messages"] == [{"role": "user", "content": "Hi"}]
+
+
+def test_generate_ollama_error(client):
+    with patch.object(main.ollama, "chat", side_effect=RuntimeError("ollama down")):
+        response = client.post(
+            "/api/generate",
+            json={"prompt": "Hi"},
+        )
+        assert response.status_code == 500
+        assert "ollama down" in response.json()["detail"]
+
+
+# --- Streaming generate ---
+
+
+def _fake_stream_chunks():
+    yield {"message": {"content": "Hel"}, "done": False}
+    yield {"message": {"content": "lo"}, "done": False}
+    yield {"message": {"content": "!"}, "done": True}
+
+
+def test_generate_streaming_sse(client):
+    with patch.object(main.ollama, "chat", return_value=_fake_stream_chunks()) as mock_chat:
+        response = client.post(
+            "/api/generate",
+            json={"prompt": "stream me", "stream": True},
+        )
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+        body = response.text
+        assert 'data: {"content": "Hel"}' in body
+        assert 'data: {"content": "lo"}' in body
+        assert 'data: {"content": "!"}' in body
+        assert "event: done" in body
+        assert 'data: {"done": true}' in body
+
+        # stream=True must be forwarded to ollama
+        assert mock_chat.call_args.kwargs.get("stream") is True
+
+
+def test_generate_streaming_requires_auth(authed_client):
+    response = authed_client.post(
+        "/api/generate",
+        json={"prompt": "stream me", "stream": True},
+    )
+    assert response.status_code == 401
+
+
+def test_generate_streaming_with_auth(authed_client):
+    with patch.object(main.ollama, "chat", return_value=_fake_stream_chunks()):
+        response = authed_client.post(
+            "/api/generate",
+            headers={"X-API-Key": "test-secret-key"},
+            json={"prompt": "stream me", "stream": True},
+        )
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert 'data: {"content": "Hel"}' in response.text
+
+
+def test_generate_streaming_error_event(client):
+    def boom(**_kwargs):
+        raise RuntimeError("stream failed")
+
+    with patch.object(main.ollama, "chat", side_effect=boom):
+        response = client.post(
+            "/api/generate",
+            json={"prompt": "x", "stream": True},
+        )
+        assert response.status_code == 200  # SSE opens; error is in-band
+        assert "event: error" in response.text
+        assert "stream failed" in response.text

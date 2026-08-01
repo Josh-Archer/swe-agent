@@ -1,0 +1,19 @@
+# Optional: restrict the AI agent to in-cluster traffic only.
+# Use this instead of (or together with) API_KEY when the service is ClusterIP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: ai-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from any pod in the same namespace (tighten selectors as needed)
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
