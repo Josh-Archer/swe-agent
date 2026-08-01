@@ -1,18 +1,14 @@
-import logging
 import os
-from typing import NoReturn
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import httpx
 import ollama
-from ollama import RequestError, ResponseError
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+# Default model used for generation and readiness checks
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
 
 # Initialize the FastAPI app
 app = FastAPI(
@@ -24,7 +20,7 @@ app = FastAPI(
 # --- Pydantic Models ---
 class GenerateRequest(BaseModel):
     prompt: str
-    model: str = os.getenv("OLLAMA_MODEL", "llama2") # Default model from env or hardcoded
+    model: str = DEFAULT_MODEL
 
 class GenerateResponse(BaseModel):
     response: str
@@ -37,111 +33,42 @@ class FeedbackRequest(BaseModel):
 
 class FeedbackResponse(BaseModel):
     message: str
-    feedback_id: str # A unique ID for the feedback record
-
-
-def _is_model_not_found(error: ResponseError) -> bool:
-    """Return True when Ollama indicates the requested model is missing."""
-    message = (error.error or str(error)).lower()
-    if error.status_code == 404:
-        return True
-    return "not found" in message or ("model" in message and "pull" in message)
-
-
-def _raise_mapped_ollama_error(exc: Exception, *, model: str) -> NoReturn:
-    """
-    Map Ollama/client failures to clear HTTP status codes and log structured detail.
-
-    - 503: Ollama unreachable / connection / timeout
-    - 400: bad client input (missing model, model not found, request errors)
-    - 502: other upstream Ollama response failures
-    - 500: unexpected internal errors
-    """
-    if isinstance(exc, (ConnectionError, httpx.ConnectError, httpx.TimeoutException)):
-        logger.error(
-            "ollama_unavailable",
-            extra={
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "model": model,
-                "http_status": 503,
-            },
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Ollama service is unavailable. "
-                "Check that Ollama is running and reachable."
-            ),
-        ) from exc
-
-    if isinstance(exc, RequestError):
-        logger.error(
-            "ollama_request_error",
-            extra={
-                "error_type": "RequestError",
-                "error": str(exc),
-                "model": model,
-                "http_status": 400,
-            },
-        )
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid Ollama request: {exc.error or str(exc)}",
-        ) from exc
-
-    if isinstance(exc, ResponseError):
-        if _is_model_not_found(exc):
-            status = 400
-            detail = (
-                f"Model '{model}' was not found on the Ollama server. "
-                f"Pull the model or choose an available one. "
-                f"Upstream: {exc.error or str(exc)}"
-            )
-            log_event = "ollama_model_not_found"
-        else:
-            status = 502
-            detail = (
-                f"Ollama upstream error while generating with model '{model}': "
-                f"{exc.error or str(exc)}"
-            )
-            log_event = "ollama_upstream_error"
-
-        logger.error(
-            log_event,
-            extra={
-                "error_type": "ResponseError",
-                "error": str(exc),
-                "upstream_status": exc.status_code,
-                "model": model,
-                "http_status": status,
-            },
-        )
-        raise HTTPException(status_code=status, detail=detail) from exc
-
-    logger.exception(
-        "ollama_unexpected_error",
-        extra={
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "model": model,
-            "http_status": 500,
-        },
-    )
-    raise HTTPException(
-        status_code=500,
-        detail=f"Unexpected error generating response: {type(exc).__name__}",
-    ) from exc
+    feedback_id: str  # A unique ID for the feedback record
 
 
 # --- API Endpoints ---
 
-@app.get("/", summary="Health Check", description="Check if the API is running.")
+@app.get("/", summary="Liveness Check", description="Check if the API process is running.")
 def read_root():
     """
-    Root endpoint to check if the API is up and running.
+    Root endpoint for liveness probes. Does not depend on Ollama or the model.
     """
     return {"status": "ok"}
+
+
+@app.get(
+    "/ready",
+    summary="Readiness Check",
+    description="Check if the API is ready to serve generate requests (Ollama model is pulled).",
+)
+def readiness():
+    """
+    Readiness probe endpoint.
+
+    Returns 200 only when the configured OLLAMA_MODEL is available on the
+    Ollama host. Returns 503 otherwise so Kubernetes does not send traffic
+    until the model has been pulled.
+    """
+    model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+    try:
+        ollama.show(model)
+        return {"status": "ready", "model": model}
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{model}' is not available on Ollama. "
+                   f"Pull it before marking the service ready. Error: {e}",
+        )
 
 
 @app.post("/api/generate", response_model=GenerateResponse, summary="Generate Agent Response")
@@ -150,7 +77,7 @@ async def generate(request: GenerateRequest):
     Generates a response from the specified Ollama model based on the prompt.
 
     - **prompt**: The input text to the model.
-    - **model**: The name of the Ollama model to use (e.g., 'llama2', 'codellama').
+    - **model**: The name of the Ollama model to use (e.g. 'llama2', 'codellama').
     """
     try:
         ollama_response = ollama.chat(
@@ -160,7 +87,8 @@ async def generate(request: GenerateRequest):
         response_content = ollama_response['message']['content']
         return GenerateResponse(response=response_content)
     except Exception as e:
-        _raise_mapped_ollama_error(e, model=request.model)
+        # Broad exception for now, can be refined
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/feedback", response_model=FeedbackResponse, summary="Submit Feedback")

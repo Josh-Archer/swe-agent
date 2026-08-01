@@ -1,0 +1,52 @@
+# One-shot Job to pull the Ollama model used by the AI agent.
+# Apply AFTER the Ollama deployment/service are running:
+#   kubectl apply -f k8s/ollama-model-pull-job.yaml
+#
+# Keep OLLAMA_MODEL in sync with k8s/deployment.yaml (ai-agent env).
+# Delete and re-apply the Job to pull again (Jobs are immutable once complete):
+#   kubectl delete job ollama-model-pull
+#   kubectl apply -f k8s/ollama-model-pull-job.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-model-pull
+  labels:
+    app: ollama-model-pull
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: ollama-model-pull
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: pull-model
+        image: ollama/ollama:latest
+        # Use the Ollama CLI against the in-cluster service.
+        env:
+        - name: OLLAMA_HOST
+          value: "http://ollama-service:11434"
+        - name: OLLAMA_MODEL
+          value: "llama2" # Must match ai-agent OLLAMA_MODEL
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Waiting for Ollama at ${OLLAMA_HOST}..."
+          i=0
+          until ollama list >/dev/null 2>&1; do
+            i=$((i+1))
+            if [ "$i" -gt 60 ]; then
+              echo "Timed out waiting for Ollama"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Pulling model: ${OLLAMA_MODEL}"
+          ollama pull "${OLLAMA_MODEL}"
+          echo "Model pull complete."
+          ollama list
