@@ -272,17 +272,23 @@ class AgentLoop:
                 )
 
         # Clone into workspace. Workspace must be empty for git clone .
-        clone_cmd = ["git", "clone", "--depth", "1", "--", repo_url, "."]
+        # When git_ref is set, fetch that ref shallowly via --branch so
+        # non-default branches/tags are present (depth-1 of default tip
+        # alone cannot check out another ref).
         if git_ref:
-            # clone then checkout ref (shallow clone of default branch first)
-            result = self.tools.run_command(
-                clone_cmd, timeout=120, shell=False
-            )
-            if not result.ok:
-                return result
-            return self.tools.run_command(
-                ["git", "checkout", git_ref, "--"], timeout=60, shell=False
-            )
+            clone_cmd = [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                git_ref,
+                "--",
+                repo_url,
+                ".",
+            ]
+        else:
+            clone_cmd = ["git", "clone", "--depth", "1", "--", repo_url, "."]
 
         return self.tools.run_command(clone_cmd, timeout=120, shell=False)
 
