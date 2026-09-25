@@ -222,23 +222,41 @@ def test_prepare_workspace_runs_git_without_shell(sandbox_tools, monkeypatch):
         git_ref="feature-branch",
     )
     assert result.ok
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0] == (
         [
             "git",
             "clone",
             "--depth",
             "1",
+            "--branch",
+            "feature-branch",
             "--",
             "https://github.com/example/repo.git",
             ".",
         ],
         False,
     )
-    assert calls[1] == (
-        ["git", "checkout", "feature-branch", "--"],
-        False,
+
+
+def test_prepare_workspace_with_ref_uses_branch_flag(sandbox_tools, monkeypatch):
+    """Non-default refs must be shallow-cloned via --branch, not checkout after default tip."""
+    calls: list[list[str]] = []
+
+    def mock_run_command(cmd, *, timeout=None, shell=None):
+        calls.append(list(cmd))
+        return ToolResult(ok=True, tool="run_command", output="ok")
+
+    monkeypatch.setattr(sandbox_tools, "run_command", mock_run_command)
+    loop = AgentLoop(llm=ScriptedLLM([]), tools=sandbox_tools)
+    result = loop.prepare_workspace(
+        repo_url="https://github.com/example/repo.git",
+        git_ref="v1.2.3",
     )
+    assert result.ok
+    assert calls[0][calls[0].index("--branch") + 1] == "v1.2.3"
+    assert "--" in calls[0]
+    assert "checkout" not in calls[0]
 
 
 def test_prepare_workspace_clone_without_ref_has_separator(
