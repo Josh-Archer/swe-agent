@@ -421,3 +421,47 @@ def test_validate_git_arg_invalid():
     assert "contains forbidden" in validate_git_arg("ref\n", "git_ref")
     assert "contains forbidden" in validate_git_arg("ref\r", "git_ref")
     assert "contains forbidden" in validate_git_arg("ref\x00", "git_ref")
+
+
+
+def test_api_tools_endpoint_does_not_create_workspace(tmp_path, monkeypatch):
+    """GET /api/tools must not create a disposable Sandbox workspace."""
+    monkeypatch.setenv("AGENT_SANDBOX_ROOT", str(tmp_path))
+    # Reset cached root if any helper reads env at import time.
+    before = {p.name for p in tmp_path.iterdir()} if tmp_path.exists() else set()
+    client = TestClient(app)
+    for _ in range(3):
+        response = client.get("/api/tools")
+        assert response.status_code == 200
+        assert {t["name"] for t in response.json()["tools"]} == {
+            "run_command",
+            "read_file",
+            "write_file",
+        }
+    after = {p.name for p in tmp_path.iterdir()}
+    assert after == before, f"GET /api/tools created workspaces: {after - before}"
+
+
+def test_run_resolve_job_cleans_up_owned_workspace(tmp_path, monkeypatch):
+    """Finished resolve jobs must remove the sandbox workspace they created."""
+    monkeypatch.setenv("AGENT_SANDBOX_ROOT", str(tmp_path))
+    llm = ScriptedLLM(
+        [
+            json.dumps(
+                {"action": "write_file", "path": "note.txt", "content": "hi"}
+            ),
+            json.dumps(
+                {"action": "finish", "summary": "done", "success": True}
+            ),
+        ]
+    )
+    record = run_resolve_job(
+        "Write note.txt",
+        llm=llm,
+        tools=None,  # force AgentLoop to own a fresh sandbox
+        max_steps=5,
+        async_mode=False,
+    )
+    assert record["status"] == "succeeded"
+    leftover = [p for p in tmp_path.iterdir() if p.is_dir()]
+    assert leftover == [], f"workspace not cleaned up: {leftover}"

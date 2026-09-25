@@ -343,8 +343,13 @@ class Tools:
 
     # -- helpers ------------------------------------------------------------
 
-    def list_tools(self) -> list[dict[str, str]]:
-        """Describe available tools (for LLM system prompts / API docs)."""
+    @staticmethod
+    def list_tools() -> list[dict[str, str]]:
+        """Describe available tools (for LLM system prompts / API docs).
+
+        Static so callers (e.g. GET /api/tools) can list tools without
+        constructing a Sandbox workspace.
+        """
         return [
             {
                 "name": "run_command",

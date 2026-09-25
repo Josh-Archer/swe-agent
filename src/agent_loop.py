@@ -569,6 +569,10 @@ def run_resolve_job(
 
     def _execute() -> None:
         job_store.set_running(job_id)
+        # Caller-supplied tools own their sandbox (tests); otherwise we
+        # create one and must clean it up when the job finishes.
+        owns_sandbox = tools is None
+        loop: AgentLoop | None = None
         try:
             loop = AgentLoop(
                 llm=llm,
@@ -586,6 +590,9 @@ def run_resolve_job(
             job_store.set_result(job_id, result)
         except Exception as exc:  # noqa: BLE001
             job_store.set_error(job_id, str(exc))
+        finally:
+            if owns_sandbox and loop is not None:
+                loop.tools.sandbox.cleanup()
 
     if async_mode:
         if runner is not None:
