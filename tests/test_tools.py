@@ -99,3 +99,36 @@ def test_list_tools(tools):
 def test_workspace_under_sandbox_root(tools, tmp_path):
     root = Path(os.environ["AGENT_SANDBOX_ROOT"]).resolve()
     assert tools.sandbox.workspace.is_relative_to(root)
+
+
+def test_run_command_sequence(tools):
+    tools.write_file("seq.txt", "sequence output")
+    result = tools.run_command(
+        ["python", "-c", "print(open('seq.txt').read().strip())"],
+        shell=False,
+    )
+    assert result.ok
+    assert "sequence output" in result.output
+
+
+def test_run_command_string_without_shell(tools):
+    result = tools.run_command(
+        "python -c \"print('no-shell')\"",
+        shell=False,
+    )
+    assert result.ok
+    assert "no-shell" in result.output
+
+
+def test_run_command_empty_command(tools):
+    res_empty_str = tools.run_command("")
+    assert not res_empty_str.ok
+    assert res_empty_str.error == "Empty command"
+
+    res_empty_list = tools.run_command([])
+    assert not res_empty_list.ok
+    assert res_empty_list.error == "Empty command"
+
+    res_whitespace_list = tools.run_command([" ", "  "])
+    assert not res_whitespace_list.ok
+    assert res_whitespace_list.error == "Empty command"

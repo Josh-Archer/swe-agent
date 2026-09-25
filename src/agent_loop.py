@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from src.tools import Sandbox, ToolResult, Tools
+from src.tools import ToolResult, Tools
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +165,22 @@ def parse_agent_action(text: str) -> dict[str, Any]:
     }
 
 
+def validate_git_arg(value: str, name: str) -> str | None:
+    """
+    Validate that a git argument does not contain options or invalid chars.
+
+    Rejects any value that starts with "-", is empty/whitespace, or contains
+    NUL or newline characters.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return f"Invalid {name}: cannot be empty or whitespace"
+    if value.startswith("-") or value.lstrip().startswith("-"):
+        return f"Invalid {name}: cannot start with '-'"
+    if any(c in value for c in ("\x00", "\n", "\r")):
+        return f"Invalid {name}: contains forbidden characters"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
@@ -184,6 +200,8 @@ class AgentLoop:
     test_command:
         Optional default test command suggested in the initial user message.
     """
+
+    _validate_git_arg = staticmethod(validate_git_arg)
 
     def __init__(
         self,
@@ -214,24 +232,59 @@ class AgentLoop:
         If ``repo_url`` is None the existing (empty or pre-seeded) workspace
         is used as-is — useful for local job mode / tests.
         """
-        if not repo_url:
+        if repo_url is None:
+            if git_ref is not None:
+                err = self._validate_git_arg(git_ref, "git_ref")
+                if err:
+                    return ToolResult(
+                        ok=False,
+                        tool="prepare_workspace",
+                        error=err,
+                        meta={"git_ref": git_ref},
+                    )
             return ToolResult(
                 ok=True,
                 tool="prepare_workspace",
-                output=f"Using existing workspace at {self.tools.sandbox.workspace}",
+                output=(
+                    "Using existing workspace at "
+                    f"{self.tools.sandbox.workspace}"
+                ),
                 meta={"workspace": str(self.tools.sandbox.workspace)},
             )
 
+        err = self._validate_git_arg(repo_url, "repo_url")
+        if err:
+            return ToolResult(
+                ok=False,
+                tool="prepare_workspace",
+                error=err,
+                meta={"repo_url": repo_url},
+            )
+
+        if git_ref is not None:
+            err = self._validate_git_arg(git_ref, "git_ref")
+            if err:
+                return ToolResult(
+                    ok=False,
+                    tool="prepare_workspace",
+                    error=err,
+                    meta={"git_ref": git_ref},
+                )
+
         # Clone into workspace. Workspace must be empty for git clone .
-        clone_cmd = f"git clone --depth 1 {repo_url} ."
+        clone_cmd = ["git", "clone", "--depth", "1", "--", repo_url, "."]
         if git_ref:
             # clone then checkout ref (shallow clone of default branch first)
-            result = self.tools.run_command(clone_cmd, timeout=120)
+            result = self.tools.run_command(
+                clone_cmd, timeout=120, shell=False
+            )
             if not result.ok:
                 return result
-            return self.tools.run_command(f"git checkout {git_ref}", timeout=60)
+            return self.tools.run_command(
+                ["git", "checkout", git_ref, "--"], timeout=60, shell=False
+            )
 
-        return self.tools.run_command(clone_cmd, timeout=120)
+        return self.tools.run_command(clone_cmd, timeout=120, shell=False)
 
     def run(
         self,
