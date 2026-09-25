@@ -136,9 +136,8 @@ def list_tools():
     Safety defaults: workspaces are created under a temp sandbox root;
     host filesystem mounts are disabled unless AGENT_ALLOW_HOST_MOUNT=true.
     """
-    tools = Tools()
     return ToolsInfoResponse(
-        tools=tools.list_tools(),
+        tools=Tools.list_tools(),
         sandbox_root=str(_default_sandbox_root()),
         host_mount_allowed=host_mount_allowed(),
         notes=[
