@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from src.agent_loop import AgentLoop, JobStore, parse_agent_action, run_resolve_job
 from src.main import app
-from src.tools import Sandbox, Tools
+from src.tools import Sandbox, ToolResult, Tools
 
 
 class ScriptedLLM:
@@ -193,3 +193,51 @@ def test_job_store_lifecycle():
     assert store.get("j1")["status"] == "queued"
     store.set_running("j1")
     assert store.get("j1")["status"] == "running"
+
+
+def test_prepare_workspace_no_repo(sandbox_tools):
+    loop = AgentLoop(llm=ScriptedLLM([]), tools=sandbox_tools)
+    result = loop.prepare_workspace()
+    assert result.ok
+    assert "Using existing workspace" in result.output
+
+
+def test_prepare_workspace_runs_git_without_shell(sandbox_tools, monkeypatch):
+    calls: list[tuple[object, object]] = []
+
+    def mock_run_command(cmd, *, timeout=None, shell=None):
+        calls.append((cmd, shell))
+        return ToolResult(ok=True, tool="run_command", output="ok")
+
+    monkeypatch.setattr(sandbox_tools, "run_command", mock_run_command)
+    loop = AgentLoop(llm=ScriptedLLM([]), tools=sandbox_tools)
+    result = loop.prepare_workspace(
+        repo_url="https://github.com/example/repo.git",
+        git_ref="feature-branch",
+    )
+    assert result.ok
+    assert len(calls) == 2
+    assert calls[0] == (
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/example/repo.git",
+            ".",
+        ],
+        False,
+    )
+    assert calls[1] == (
+        ["git", "checkout", "feature-branch"],
+        False,
+    )
+
+
+def test_prepare_workspace_prevents_shell_injection(sandbox_tools, tmp_path):
+    marker = tmp_path / "pwned.txt"
+    bad_repo_url = f"https://invalid.example.com/repo.git; touch {marker}"
+    loop = AgentLoop(llm=ScriptedLLM([]), tools=sandbox_tools)
+    result = loop.prepare_workspace(repo_url=bad_repo_url)
+    assert not result.ok
+    assert not marker.exists()

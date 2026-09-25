@@ -16,7 +16,9 @@ Safety defaults
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -179,10 +181,10 @@ class Tools:
 
     def run_command(
         self,
-        command: str,
+        command: str | Sequence[str],
         *,
         timeout: int | None = None,
-        shell: bool = True,
+        shell: bool | None = None,
     ) -> ToolResult:
         """
         Run a command with cwd=workspace and a hard timeout.
@@ -192,17 +194,55 @@ class Tools:
           Isolation relies on workspace confinement + container deployment.
         * Prefer deploying this agent in k8s without hostPath mounts.
         """
-        if not command or not command.strip():
+        if not command:
             return ToolResult(
                 ok=False,
                 tool="run_command",
                 error="Empty command",
             )
 
+        if isinstance(command, str):
+            if not command.strip():
+                return ToolResult(
+                    ok=False,
+                    tool="run_command",
+                    error="Empty command",
+                )
+        else:
+            if not any(str(arg).strip() for arg in command):
+                return ToolResult(
+                    ok=False,
+                    tool="run_command",
+                    error="Empty command",
+                )
+
+        if shell is None:
+            shell = False if not isinstance(command, str) else True
+
+        cmd: str | Sequence[str]
+        if isinstance(command, str) and not shell:
+            try:
+                cmd = shlex.split(command)
+            except ValueError as exc:
+                return ToolResult(
+                    ok=False,
+                    tool="run_command",
+                    error=f"Invalid command syntax: {exc}",
+                    meta={"command": command},
+                )
+            if not cmd:
+                return ToolResult(
+                    ok=False,
+                    tool="run_command",
+                    error="Empty command",
+                )
+        else:
+            cmd = command
+
         timeout = timeout if timeout is not None else self.command_timeout
         try:
             completed = subprocess.run(
-                command,
+                cmd,
                 shell=shell,
                 cwd=str(self.sandbox.workspace),
                 capture_output=True,
@@ -220,7 +260,11 @@ class Tools:
                 ok=completed.returncode == 0,
                 tool="run_command",
                 output=combined,
-                error=None if completed.returncode == 0 else f"exit code {completed.returncode}",
+                error=(
+                    None
+                    if completed.returncode == 0
+                    else f"exit code {completed.returncode}"
+                ),
                 meta={
                     "returncode": completed.returncode,
                     "command": command,

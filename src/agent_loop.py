@@ -223,15 +223,19 @@ class AgentLoop:
             )
 
         # Clone into workspace. Workspace must be empty for git clone .
-        clone_cmd = f"git clone --depth 1 {repo_url} ."
+        clone_cmd = ["git", "clone", "--depth", "1", repo_url, "."]
         if git_ref:
             # clone then checkout ref (shallow clone of default branch first)
-            result = self.tools.run_command(clone_cmd, timeout=120)
+            result = self.tools.run_command(
+                clone_cmd, timeout=120, shell=False
+            )
             if not result.ok:
                 return result
-            return self.tools.run_command(f"git checkout {git_ref}", timeout=60)
+            return self.tools.run_command(
+                ["git", "checkout", git_ref], timeout=60, shell=False
+            )
 
-        return self.tools.run_command(clone_cmd, timeout=120)
+        return self.tools.run_command(clone_cmd, timeout=120, shell=False)
 
     def run(
         self,
