@@ -9,5 +9,9 @@ spec:
     - protocol: TCP
       port: 80
       targetPort: 8000
-  type: LoadBalancer # Use LoadBalancer to expose the service externally.
-                    # For internal-only access, change to ClusterIP.
+  # Public entrypoint. /api/resolve and /api/generate reject calls that do
+  # not present API_KEY (X-API-Key or Authorization: Bearer). Create the
+  # ai-agent-secrets Secret referenced by the Deployment before exposing this
+  # Service. For in-cluster clients only, set type to ClusterIP and apply
+  # networkpolicy.yaml. The API key check still applies either way.
+  type: LoadBalancer

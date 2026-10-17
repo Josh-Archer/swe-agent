@@ -19,6 +19,9 @@ EXPOSE 8000
 # Define environment variable for the default model
 ENV OLLAMA_MODEL="llama2"
 
+# API_KEY is required at runtime for /api/resolve and /api/generate.
+# Do not bake a key into the image; inject it from the environment or a Secret.
+
 # Default durable feedback storage (mount a volume at /app/data in production)
 ENV FEEDBACK_STORAGE_BACKEND="sqlite"
 ENV FEEDBACK_STORAGE_PATH="/app/data/feedback.db"

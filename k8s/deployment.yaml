@@ -28,6 +28,15 @@ spec:
         # If running Ollama in the same cluster, you can use its service name.
         - name: OLLAMA_HOST
           value: "http://ollama-service:11434"
+        # Required for /api/resolve and /api/generate. The process rejects
+        # those routes when API_KEY is missing. Create the secret first:
+        #   kubectl create secret generic ai-agent-secrets \
+        #     --from-literal=api-key="$(openssl rand -hex 32)"
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ai-agent-secrets
+              key: api-key
         # Liveness: process is up (does not require the model).
         livenessProbe:
           httpGet:

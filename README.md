@@ -5,6 +5,7 @@ This project provides a template for creating a k3s-deployable AI agent that wra
 ## Features
 
 *   **FastAPI Backend**: A Python-based backend using FastAPI to serve the agent's API.
+*   **API authentication**: `POST /api/resolve` and `POST /api/generate` require `API_KEY` (`X-API-Key` or `Authorization: Bearer`). Requests without a matching key are rejected, including when `API_KEY` is unset.
 *   **Ollama Integration**: Pre-configured to connect to an Ollama instance for LLM inference.
 *   **Tool-using agent loop**: Sandboxed `run_command`, `read_file`, and `write_file` tools with an iterative resolve flow (checkout → edit → test → patch).
 *   **Issue resolution API**: Synchronous or background job mode via `POST /api/resolve`.
@@ -36,26 +37,49 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
     pip install -r requirements.txt
     ```
 
-2.  **Run the application:**
+2.  **Set the API key** (required for `/api/resolve` and `/api/generate`):
+    ```bash
+    export API_KEY=dev-secret
+    ```
+    Do not commit this value. When `API_KEY` is unset or blank, those two routes return `401`.
+
+3.  **Run the application:**
     ```bash
     uvicorn src.main:app --reload
     ```
     The application will be available at `http://127.0.0.1:8000`.
 
-3.  **Run tests:**
+4.  **Run tests:**
     ```bash
     pytest
     ```
 
 ## API Endpoints
 
-*   `GET /`: Health check.
+*   `GET /`: Health check. Public, so Kubernetes probes keep working.
+*   `GET /ready`: Readiness check. Public.
 *   `GET /api/tools`: List the minimal tool interface and sandbox safety notes.
-*   `POST /api/generate`: Takes a prompt and returns a response from the LLM.
+*   `POST /api/generate`: Takes a prompt and returns a response from the LLM. **Requires API key.**
 *   `POST /api/feedback`: Allows submitting feedback on the agent's responses to be used for future training.
-*   `POST /api/resolve`: Run the tool-using agent loop against an issue (sync or async job).
+*   `POST /api/resolve`: Run the tool-using agent loop against an issue (sync or async job). **Requires API key.**
 *   `GET /api/jobs`: List in-memory resolve jobs.
 *   `GET /api/jobs/{job_id}`: Fetch status/result for a resolve job.
+
+### Authentication
+
+`POST /api/resolve` and `POST /api/generate` require the `API_KEY` environment variable. Send either header:
+
+*   `X-API-Key: <API_KEY>`
+*   `Authorization: Bearer <API_KEY>`
+
+If `X-API-Key` is present it is the credential that is checked. Query parameters are ignored. A missing key, a wrong key, and a server with no `API_KEY` configured all receive `401` with `WWW-Authenticate: Bearer`. The comparison is constant-time. `/`, `/ready`, feedback, tool listing, and job status stay reachable without the key so probes and local inspection keep working.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/api/generate" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-secret" \
+  -d '{"prompt": "Explain Kubernetes in one sentence.", "model": "llama2"}'
+```
 
 ### Resolve example
 
@@ -64,6 +88,7 @@ Synchronous (waits for the agent to finish):
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/resolve \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev-secret" \
   -d '{
     "issue": "Add a function add(a, b) in mathutil.py and make a simple test pass",
     "max_steps": 10,
@@ -77,6 +102,7 @@ Background job mode:
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/resolve \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-secret" \
   -d '{"issue":"Fix the failing unit test","repo_url":"https://github.com/example/repo.git","async_mode":true}'
 
 # then poll
@@ -115,6 +141,7 @@ Important environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve` and `/api/generate` |
 | `AGENT_SANDBOX_ROOT` | system temp subdir | Root directory for all agent workspaces |
 | `AGENT_ALLOW_HOST_MOUNT` | `false` | If `true`, allow binding an arbitrary host path as a workspace |
 | `AGENT_COMMAND_TIMEOUT` | `60` | Default command timeout (seconds) |
@@ -131,12 +158,20 @@ Important environment variables:
 
 ## Deployment
 
-1.  **Apply the Kubernetes manifests:**
+1.  **Create the API key secret** (the Deployment will not start without it):
+    ```bash
+    kubectl create secret generic ai-agent-secrets \
+      --from-literal=api-key="$(openssl rand -hex 32)"
+    ```
+    The value is injected as `API_KEY`. Do not store it in the image or the git repo.
+
+2.  **Apply the Kubernetes manifests:**
     ```bash
     kubectl apply -f k8s/
     ```
+    `k8s/service.yaml` is a LoadBalancer. `/api/resolve` and `/api/generate` still require the key. For in-cluster clients only, set the Service to `ClusterIP` and apply `k8s/networkpolicy.yaml`. That policy does not replace the key check.
 
-2.  **Verify the deployment:**
+3.  **Verify the deployment:**
     ```bash
     kubectl get pods
     kubectl get services
