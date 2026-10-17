@@ -13,6 +13,7 @@ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBea
 from pydantic import BaseModel, Field
 
 from src.agent_loop import job_store, resume_queued_jobs, run_resolve_job
+from src.storage import FeedbackRecord, create_feedback_storage
 from src.tools import Tools, _default_sandbox_root, host_mount_allowed
 
 # Load environment variables from .env file
@@ -153,6 +154,8 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+feedback_storage = create_feedback_storage()
 
 
 @app.middleware("http")
@@ -418,18 +421,16 @@ async def feedback(request: FeedbackRequest):
     - **is_correct**: A boolean indicating if the response was correct.
     - **correction**: (Optional) The corrected version of the response.
     """
-    # For now, we'll just print the feedback.
-    # In a real application, you would save this to a database or a file.
     feedback_id = os.urandom(16).hex()
-    print(f"Received feedback ({feedback_id}):")
-    print(f"  Prompt: {request.prompt}")
-    print(f"  Response: {request.response}")
-    print(f"  Correct: {request.is_correct}")
-    if request.correction:
-        print(f"  Correction: {request.correction}")
-
-    # You would typically save this to a database or a message queue
-    # for further processing.
+    feedback_storage.save(
+        FeedbackRecord(
+            feedback_id=feedback_id,
+            prompt=request.prompt,
+            response=request.response,
+            is_correct=request.is_correct,
+            correction=request.correction,
+        )
+    )
     return FeedbackResponse(
         message="Feedback received successfully. Thank you!",
         feedback_id=feedback_id

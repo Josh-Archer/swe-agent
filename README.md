@@ -60,7 +60,7 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
 *   `GET /ready`: Readiness check. Public.
 *   `GET /api/tools`: List the minimal tool interface and sandbox safety notes.
 *   `POST /api/generate`: Takes a prompt and returns a response from the LLM. **Requires API key.**
-*   `POST /api/feedback`: Allows submitting feedback on the agent's responses to be used for future training.
+*   `POST /api/feedback`: Persists feedback on the agent's responses for future training.
 *   `POST /api/resolve`: Run the tool-using agent loop against an issue (sync or async job). **Requires API key.**
 *   `GET /api/jobs`: List persisted resolve jobs.
 *   `GET /api/jobs/{job_id}`: Fetch status/result for a resolve job.
@@ -143,6 +143,8 @@ Important environment variables:
 |----------|---------|---------|
 | `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve` and `/api/generate` |
 | `AGENT_SANDBOX_ROOT` | system temp subdir | Root directory for all agent workspaces |
+| `FEEDBACK_STORAGE_BACKEND` | `sqlite` | Feedback storage backend: `sqlite` or `file` |
+| `FEEDBACK_STORAGE_PATH` | `data/feedback.db` | SQLite database path or JSON feedback directory, depending on backend |
 | `JOB_STORAGE_PATH` | `data/jobs.db` | SQLite database for durable resolve job requests, statuses, and results |
 | `AGENT_ALLOW_HOST_MOUNT` | `false` | If `true`, allow binding an arbitrary host path as a workspace |
 | `AGENT_COMMAND_TIMEOUT` | `60` | Default command timeout (seconds) |

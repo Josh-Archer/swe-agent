@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from src import main
 from src.main import app
+from src.storage import create_feedback_storage
 
 # The TestClient runs the app in-process and handles the event loop,
 # so we can use standard `def` test functions.
@@ -44,15 +45,22 @@ def test_ready_when_model_is_missing():
         assert "not available" in detail
 
 
-def test_feedback_endpoint():
+def test_feedback_endpoint(tmp_path, monkeypatch):
     """
     Test the /api/feedback endpoint to ensure it accepts valid feedback.
     The TestClient handles the async nature of the endpoint.
     """
+    storage_path = tmp_path / "feedback.db"
+    monkeypatch.setattr(
+        main,
+        "feedback_storage",
+        create_feedback_storage("sqlite", str(storage_path)),
+    )
     feedback_data = {
         "prompt": "What is the capital of France?",
         "response": "Paris",
-        "is_correct": True,
+        "is_correct": False,
+        "correction": "Lyon",
     }
     response = client.post("/api/feedback", json=feedback_data)
 
@@ -60,7 +68,17 @@ def test_feedback_endpoint():
     json_response = response.json()
     assert "message" in json_response
     assert "feedback_id" in json_response
-    assert json_response["message"] == "Feedback received successfully. Thank you!"
+    assert json_response["message"] == (
+        "Feedback received successfully. Thank you!"
+    )
+    record = create_feedback_storage("sqlite", str(storage_path)).get(
+        json_response["feedback_id"]
+    )
+    assert record is not None
+    assert record.prompt == feedback_data["prompt"]
+    assert record.response == feedback_data["response"]
+    assert record.is_correct is feedback_data["is_correct"]
+    assert record.correction == feedback_data["correction"]
 
 
 API_KEY = "test-secret-key"
