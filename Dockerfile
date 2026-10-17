@@ -25,6 +25,7 @@ ENV OLLAMA_MODEL="llama2"
 # Default durable feedback storage (mount a volume at /app/data in production)
 ENV FEEDBACK_STORAGE_BACKEND="sqlite"
 ENV FEEDBACK_STORAGE_PATH="/app/data/feedback.db"
+ENV JOB_STORAGE_PATH="/app/data/jobs.db"
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from src.agent_loop import (
     AgentLoop,
+    AgentResult,
     JobStore,
     parse_agent_action,
     run_resolve_job,
@@ -195,12 +196,41 @@ def test_api_job_not_found():
     assert response.status_code == 404
 
 
-def test_job_store_lifecycle():
-    store = JobStore()
+def test_job_store_lifecycle(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
     store.create("j1", {"issue": "x"})
     assert store.get("j1")["status"] == "queued"
     store.set_running("j1")
     assert store.get("j1")["status"] == "running"
+
+
+def test_job_store_persists_status_and_result_after_restart(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    store = JobStore(db_path)
+    store.create("persisted", {"issue": "x", "max_steps": 3})
+    store.set_running("persisted")
+    store.set_result(
+        "persisted",
+        AgentResult(job_id="persisted", status="succeeded", issue="x", summary="done"),
+    )
+
+    restarted_store = JobStore(db_path)
+    record = restarted_store.get("persisted")
+    assert record["status"] == "succeeded"
+    assert record["request"] == {"issue": "x", "max_steps": 3}
+    assert record["result"]["summary"] == "done"
+    assert record["error"] is None
+
+
+def test_job_store_requeues_interrupted_jobs_on_restart(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    store = JobStore(db_path)
+    store.create("interrupted", {"issue": "x"})
+    store.set_running("interrupted")
+
+    restarted_store = JobStore(db_path)
+    assert restarted_store.get("interrupted")["status"] == "queued"
+    assert restarted_store.queued_jobs()[0]["job_id"] == "interrupted"
 
 
 def test_prepare_workspace_no_repo(sandbox_tools):

@@ -15,12 +15,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
+import threading
 import uuid
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from pathlib import Path
+from typing import Any, Protocol
 
 from src.tools import ToolResult, Tools
-
 
 # ---------------------------------------------------------------------------
 # Types
@@ -490,50 +495,113 @@ class AgentLoop:
 # ---------------------------------------------------------------------------
 
 class JobStore:
-    """
-    Minimal in-process job registry for issue-resolution runs.
+    """SQLite-backed job registry and durable queue for resolve runs."""
 
-    Suitable for single-replica demos. For production, replace with a
-    durable queue / database.
-    """
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        self._db_path = Path(
+            db_path or os.getenv("JOB_STORAGE_PATH", "data/jobs.db")
+        )
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resolve_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT
+                )
+                """
+            )
+            # A process may have stopped while a job was running. Put it back
+            # on the durable queue so startup recovery can execute it again.
+            conn.execute(
+                "UPDATE resolve_jobs SET status = 'queued' WHERE status = 'running'"
+            )
 
-    def __init__(self) -> None:
-        self._jobs: dict[str, dict[str, Any]] = {}
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "request": json.loads(row["request_json"]),
+            "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            "error": row["error"],
+        }
 
     def create(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        record = {
-            "job_id": job_id,
-            "status": "queued",
-            "request": payload,
-            "result": None,
-            "error": None,
-        }
-        self._jobs[job_id] = record
-        return record
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO resolve_jobs
+                   (job_id, status, request_json, result_json, error)
+                   VALUES (?, 'queued', ?, NULL, NULL)""",
+                (job_id, json.dumps(payload)),
+            )
+        return self.get(job_id)  # type: ignore[return-value]
 
     def set_running(self, job_id: str) -> None:
-        if job_id in self._jobs:
-            self._jobs[job_id]["status"] = "running"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE resolve_jobs SET status = 'running' WHERE job_id = ?",
+                (job_id,),
+            )
 
     def set_result(self, job_id: str, result: AgentResult) -> None:
-        if job_id in self._jobs:
-            self._jobs[job_id]["status"] = result.status
-            self._jobs[job_id]["result"] = result.to_dict()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE resolve_jobs
+                   SET status = ?, result_json = ?, error = NULL WHERE job_id = ?""",
+                (result.status, json.dumps(result.to_dict()), job_id),
+            )
 
     def set_error(self, job_id: str, error: str) -> None:
-        if job_id in self._jobs:
-            self._jobs[job_id]["status"] = "error"
-            self._jobs[job_id]["error"] = error
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE resolve_jobs SET status = 'error', error = ?
+                   WHERE job_id = ?""",
+                (error, job_id),
+            )
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        return self._jobs.get(job_id)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM resolve_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return self._decode(row)
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        return list(self._jobs.values())
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM resolve_jobs ORDER BY rowid"
+            ).fetchall()
+        return [self._decode(row) for row in rows]  # type: ignore[misc]
+
+    def queued_jobs(self) -> list[dict[str, Any]]:
+        """Return persisted jobs that still need to be run."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM resolve_jobs WHERE status = 'queued' ORDER BY rowid"
+            ).fetchall()
+        return [self._decode(row) for row in rows]  # type: ignore[misc]
 
 
 # Module-level store shared by the API
 job_store = JobStore()
+_job_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="resolve-job")
 
 
 def run_resolve_job(
@@ -565,7 +633,9 @@ def run_resolve_job(
         "test_command": test_command,
         "model": model,
     }
-    record = job_store.create(job_id, payload)
+    record = job_store.get(job_id)
+    if record is None:
+        record = job_store.create(job_id, payload)
 
     def _execute() -> None:
         job_store.set_running(job_id)
@@ -598,10 +668,20 @@ def run_resolve_job(
         if runner is not None:
             runner(_execute)
         else:
-            import threading
-
-            threading.Thread(target=_execute, daemon=True).start()
+            _job_executor.submit(_execute)
         return job_store.get(job_id)  # type: ignore[return-value]
 
     _execute()
     return job_store.get(job_id)  # type: ignore[return-value]
+
+
+def resume_queued_jobs() -> None:
+    """Submit durable queued jobs after application startup."""
+    for record in job_store.queued_jobs():
+        request = record["request"]
+        _job_executor.submit(_execute_persisted_job, record["job_id"], request)
+
+
+def _execute_persisted_job(job_id: str, request: dict[str, Any]) -> None:
+    """Execute a recovered queue entry without creating a duplicate record."""
+    run_resolve_job(**request, job_id=job_id, async_mode=False)

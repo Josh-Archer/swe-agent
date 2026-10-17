@@ -16,17 +16,16 @@ Safety defaults
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Configuration (env-driven safety defaults)
@@ -217,7 +216,7 @@ class Tools:
                 )
 
         if shell is None:
-            shell = False if not isinstance(command, str) else True
+            shell = isinstance(command, str)
 
         cmd: str | Sequence[str]
         if isinstance(command, str) and not shell:
@@ -243,6 +242,7 @@ class Tools:
         try:
             completed = subprocess.run(
                 cmd,
+                check=False,
                 shell=shell,
                 cwd=str(self.sandbox.workspace),
                 capture_output=True,
