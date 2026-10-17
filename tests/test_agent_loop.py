@@ -1,6 +1,8 @@
 """Tests for the tool-using agent loop and resolve job mode."""
 
 import json
+import os
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -200,7 +202,7 @@ def test_job_store_lifecycle(tmp_path):
     store = JobStore(tmp_path / "jobs.db")
     store.create("j1", {"issue": "x"})
     assert store.get("j1")["status"] == "queued"
-    store.set_running("j1")
+    assert store.claim("j1")
     assert store.get("j1")["status"] == "running"
 
 
@@ -208,7 +210,7 @@ def test_job_store_persists_status_and_result_after_restart(tmp_path):
     db_path = tmp_path / "jobs.db"
     store = JobStore(db_path)
     store.create("persisted", {"issue": "x", "max_steps": 3})
-    store.set_running("persisted")
+    assert store.claim("persisted")
     store.set_result(
         "persisted",
         AgentResult(job_id="persisted", status="succeeded", issue="x", summary="done"),
@@ -222,15 +224,72 @@ def test_job_store_persists_status_and_result_after_restart(tmp_path):
     assert record["error"] is None
 
 
-def test_job_store_requeues_interrupted_jobs_on_restart(tmp_path):
+def test_job_store_does_not_requeue_a_live_owner_on_restart(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    store = JobStore(db_path)
+    store.create("live", {"issue": "x"})
+    assert store.claim("live")
+
+    restarted_store = JobStore(db_path)
+    assert restarted_store.requeue_stale_jobs() == 0
+    assert restarted_store.get("live")["status"] == "running"
+    assert restarted_store.queued_jobs() == []
+
+
+def test_job_store_requeues_expired_lease(tmp_path):
     db_path = tmp_path / "jobs.db"
     store = JobStore(db_path)
     store.create("interrupted", {"issue": "x"})
-    store.set_running("interrupted")
-
+    assert store.claim("interrupted")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE resolve_jobs SET heartbeat = 0 WHERE job_id = 'interrupted'")
     restarted_store = JobStore(db_path)
+    assert restarted_store.requeue_stale_jobs(now=JobStore.LEASE_SECONDS + 1) == 1
     assert restarted_store.get("interrupted")["status"] == "queued"
-    assert restarted_store.queued_jobs()[0]["job_id"] == "interrupted"
+
+
+def test_double_resume_only_claims_job_once(monkeypatch, tmp_path):
+    from src import agent_loop
+
+    monkeypatch.setattr(agent_loop, "job_store", JobStore(tmp_path / "jobs.db"))
+    callbacks = []
+    calls = []
+
+    def fake_run(self, issue, **kwargs):
+        calls.append(issue)
+        return AgentResult(job_id=kwargs["job_id"], status="succeeded", issue=issue)
+
+    monkeypatch.setattr(agent_loop.AgentLoop, "run", fake_run)
+    tools = object()
+    first = run_resolve_job(
+        "once", job_id="double-resume", async_mode=True, runner=callbacks.append,
+        tools=tools,
+    )
+    second = run_resolve_job(
+        "once", job_id="double-resume", async_mode=True, runner=callbacks.append,
+        tools=tools,
+    )
+    assert first["status"] == second["status"] == "queued"
+    assert len(callbacks) == 2
+    for callback in callbacks:
+        callback()
+    assert calls == ["once"]
+
+
+def test_job_store_is_lazy_and_database_is_private(tmp_path):
+    db_path = tmp_path / "private" / "jobs.db"
+    store = JobStore(db_path)
+    assert not db_path.parent.exists()
+    store.list_jobs()
+    assert os.stat(db_path).st_mode & 0o777 == 0o600
+
+
+def test_job_store_strips_repo_url_credentials(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
+    record = store.create(
+        "credentials", {"issue": "x", "repo_url": "https://user:token@example.com/repo.git"}
+    )
+    assert record["request"]["repo_url"] == "https://example.com/repo.git"
 
 
 def test_prepare_workspace_no_repo(sandbox_tools):

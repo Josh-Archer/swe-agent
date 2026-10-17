@@ -157,7 +157,7 @@ Important environment variables:
 * Prefer deploying the agent **in Kubernetes without `hostPath` volumes** so the container filesystem boundary is the primary isolation layer.
 * Do **not** set `AGENT_ALLOW_HOST_MOUNT=true` in shared/multi-tenant environments.
 * Child processes inherit a reduced environment and set `SWE_AGENT_SANDBOX=1`.
-* Resolve jobs are stored in SQLite at `JOB_STORAGE_PATH`. The Kubernetes Deployment mounts the `ai-agent-data` PVC at `/app/data` so jobs survive pod restarts. Interrupted running jobs are returned to the queue and retried when the API starts.
+* Resolve jobs are stored in SQLite at `JOB_STORAGE_PATH` with a private database file. The Kubernetes Deployment mounts the `ai-agent-data` PVC at `/app/data` so jobs survive pod restarts, and uses the `Recreate` strategy to keep pods from overlapping as writers. A process atomically claims queued jobs and renews its owner lease while working. Startup requeues only jobs whose heartbeat lease expired; a live process keeps its job. If a process dies after making partial changes, that job is retried from scratch, so resolve execution is at-least-once across crashes. Credentials in repository URL userinfo are stripped before the URL is persisted or returned.
 
 ## Deployment
 
