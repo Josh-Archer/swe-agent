@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 # Paths that run the model or the tool-using agent. The Service is a
 # LoadBalancer, so these reject unauthenticated callers even when API_KEY
 # is unset (fail closed). Health probes stay public.
-_PROTECTED_PATHS = frozenset({"/api/resolve", "/api/generate"})
+_PROTECTED_PATHS = frozenset(
+    {"/api/resolve", "/api/generate", "/api/feedback"}
+)
+MAX_FEEDBACK_BODY_BYTES = 64 * 1024
 _AUTH_FAILED = "Invalid or missing API key"
 
 api_key_header = APIKeyHeader(
@@ -149,7 +152,8 @@ app = FastAPI(
     description=(
         "An API for interacting with an AI agent, submitting feedback, "
         "and running a tool-using issue-resolution loop in a sandbox. "
-        "POST /api/resolve and POST /api/generate require an API key."
+        "POST /api/resolve, /api/generate, and /api/feedback require "
+        "an API key."
     ),
     version="0.2.0",
     lifespan=lifespan,
@@ -175,6 +179,24 @@ async def reject_unauthenticated_protected_routes(request: Request, call_next):
                 content={"detail": exc.detail},
                 headers=dict(exc.headers) if exc.headers else None,
             )
+    if request.url.path == "/api/feedback":
+        content_length = request.headers.get("content-length")
+        if content_length and content_length.isdecimal():
+            if int(content_length) > MAX_FEEDBACK_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body exceeds 64 KB limit"},
+                )
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_FEEDBACK_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body exceeds 64 KB limit"},
+                )
+        # BaseHTTPMiddleware replays the cached request body to the endpoint.
+        request._body = bytes(body)
     return await call_next(request)
 
 
@@ -189,10 +211,10 @@ class GenerateResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    prompt: str
-    response: str
+    prompt: str = Field(..., max_length=16_384)
+    response: str = Field(..., max_length=32_768)
     is_correct: bool
-    correction: str | None = None
+    correction: str | None = Field(default=None, max_length=16_384)
 
 
 class FeedbackResponse(BaseModel):
@@ -411,7 +433,7 @@ async def generate(request: GenerateRequest):
 
 
 @app.post("/api/feedback", response_model=FeedbackResponse, summary="Submit Feedback")
-async def feedback(request: FeedbackRequest):
+def feedback(request: FeedbackRequest):
     """
     Submits feedback on a generated response. This data can be used later
     for fine-tuning the model.

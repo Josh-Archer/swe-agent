@@ -56,13 +56,16 @@ def test_feedback_endpoint(tmp_path, monkeypatch):
         "feedback_storage",
         create_feedback_storage("sqlite", str(storage_path)),
     )
+    monkeypatch.setenv("API_KEY", API_KEY)
     feedback_data = {
         "prompt": "What is the capital of France?",
         "response": "Paris",
         "is_correct": False,
         "correction": "Lyon",
     }
-    response = client.post("/api/feedback", json=feedback_data)
+    response = client.post(
+        "/api/feedback", headers=_auth_headers(), json=feedback_data
+    )
 
     assert response.status_code == 200
     json_response = response.json()
@@ -144,9 +147,14 @@ def test_protected_routes_reject_when_api_key_unset(monkeypatch):
             headers={"Authorization": "Bearer anything"},
             json={"prompt": "hello"},
         )
+        feedback = client.post(
+            "/api/feedback",
+            json={"prompt": "p", "response": "r", "is_correct": True},
+        )
 
     assert resolve.status_code == 401
     assert generate.status_code == 401
+    assert feedback.status_code == 401
     mock_resolve.assert_not_called()
     mock_chat.assert_not_called()
 
@@ -260,7 +268,7 @@ def test_resolve_accepts_bearer_token(monkeypatch):
 
 
 def test_public_routes_stay_open_when_api_key_is_set(monkeypatch):
-    """Health, readiness, tools, jobs, and feedback do not require the key."""
+    """Health, readiness, tools, and job status do not require the key."""
     monkeypatch.setenv("API_KEY", API_KEY)
     assert client.get("/").status_code == 200
     with patch("src.main.ollama.show", return_value={"modelfile": "FROM llama2"}):
@@ -272,7 +280,34 @@ def test_public_routes_stay_open_when_api_key_is_set(monkeypatch):
         "/api/feedback",
         json={"prompt": "p", "response": "r", "is_correct": True},
     )
-    assert feedback.status_code == 200
+    assert feedback.status_code == 401
+
+
+def test_feedback_rejects_oversized_body(monkeypatch):
+    monkeypatch.setenv("API_KEY", API_KEY)
+    body = (
+        b'{"prompt":"'
+        + b"x" * (64 * 1024)
+        + b'","response":"r","is_correct":true}'
+    )
+    response = client.post(
+        "/api/feedback",
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        content=body,
+    )
+
+    assert response.status_code == 413
+
+
+def test_feedback_fields_have_max_lengths(monkeypatch):
+    monkeypatch.setenv("API_KEY", API_KEY)
+    response = client.post(
+        "/api/feedback",
+        headers=_auth_headers(),
+        json={"prompt": "x" * 16_385, "response": "r", "is_correct": True},
+    )
+
+    assert response.status_code == 422
 
 
 def test_missing_api_key_is_logged_once(monkeypatch, caplog):
