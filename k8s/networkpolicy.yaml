@@ -1,5 +1,6 @@
 # Optional: restrict the AI agent to in-cluster traffic only.
-# Use this instead of (or together with) API_KEY when the service is ClusterIP.
+# Defense in depth next to API_KEY. /api/resolve and /api/generate still
+# require that key when the Service is ClusterIP.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

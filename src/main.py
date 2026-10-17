@@ -1,26 +1,170 @@
+import hashlib
+import hmac
+import logging
 import os
-from typing import Any
+from typing import Annotated, Any
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import ollama
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 from src.agent_loop import job_store, run_resolve_job
-from src.tools import Tools, host_mount_allowed, _default_sandbox_root
+from src.tools import Tools, _default_sandbox_root, host_mount_allowed
 
 # Load environment variables from .env file
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# Paths that run the model or the tool-using agent. The Service is a
+# LoadBalancer, so these reject unauthenticated callers even when API_KEY
+# is unset (fail closed). Health probes stay public.
+_PROTECTED_PATHS = frozenset({"/api/resolve", "/api/generate"})
+_AUTH_FAILED = "Invalid or missing API key"
+
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+    description="API key from the API_KEY environment variable.",
+)
+bearer_scheme = HTTPBearer(auto_error=False, description="Bearer API key.")
+
+_missing_api_key_logged = False
+
+
+def _configured_api_key() -> str:
+    """Return the server API key, or empty when it is unset or blank."""
+    return os.getenv("API_KEY", "").strip()
+
+
+def _warn_missing_api_key() -> None:
+    """Log once when the process has no API_KEY so operators can see why."""
+    global _missing_api_key_logged
+    if _missing_api_key_logged:
+        return
+    _missing_api_key_logged = True
+    logger.warning(
+        "API_KEY is not set; rejecting unauthenticated calls to %s",
+        ", ".join(sorted(_PROTECTED_PATHS)),
+    )
+
+
+def _extract_api_key(
+    x_api_key: str | None,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    """Prefer a non-empty X-API-Key; otherwise a Bearer token."""
+    if x_api_key and x_api_key.strip():
+        return x_api_key.strip()
+    if credentials and credentials.scheme.lower() == "bearer":
+        token = credentials.credentials.strip()
+        if token:
+            return token
+    return None
+
+
+def _bearer_credentials(request: Request) -> HTTPAuthorizationCredentials | None:
+    authorization = request.headers.get("authorization")
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    if not token:
+        return None
+    return HTTPAuthorizationCredentials(scheme=scheme, credentials=token)
+
+
+def _provided_api_key(request: Request) -> str | None:
+    return _extract_api_key(
+        request.headers.get("x-api-key"),
+        _bearer_credentials(request),
+    )
+
+
+def _api_keys_match(provided: str, expected: str) -> bool:
+    """Constant-time compare that does not leak the key length."""
+    provided_digest = hashlib.sha256(provided.encode("utf-8")).digest()
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(provided_digest, expected_digest)
+
+
+def ensure_api_key(request: Request) -> None:
+    """
+    Reject the request unless it presents the configured API key.
+
+    Accepted credentials (header only; query parameters are ignored):
+
+    - ``X-API-Key: <API_KEY>``
+    - ``Authorization: Bearer <API_KEY>``
+
+    When ``API_KEY`` is unset or blank, every protected call is rejected so a
+    public LoadBalancer cannot serve these routes anonymously.
+    """
+    expected = _configured_api_key()
+    if not expected:
+        _warn_missing_api_key()
+    provided = _provided_api_key(request)
+    if not expected or not provided or not _api_keys_match(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_AUTH_FAILED,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def require_api_key(
+    request: Request,
+    x_api_key: Annotated[str | None, Security(api_key_header)] = None,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Security(bearer_scheme)
+    ] = None,
+) -> None:
+    """
+    FastAPI dependency for protected routes.
+
+    ``Security`` parameters publish ``X-API-Key`` and HTTP Bearer in OpenAPI.
+    The decision uses the raw request so it matches the middleware.
+    """
+    del x_api_key, credentials
+    ensure_api_key(request)
+
 
 # Initialize the FastAPI app
 app = FastAPI(
     title="AI Agent API",
     description=(
         "An API for interacting with an AI agent, submitting feedback, "
-        "and running a tool-using issue-resolution loop in a sandbox."
+        "and running a tool-using issue-resolution loop in a sandbox. "
+        "POST /api/resolve and POST /api/generate require an API key."
     ),
     version="0.2.0",
 )
+
+
+@app.middleware("http")
+async def reject_unauthenticated_protected_routes(request: Request, call_next):
+    """
+    Fail closed before the body is parsed or a job/model call starts.
+
+    Route dependencies enforce the same check; this middleware also rejects
+    malformed payloads that would otherwise surface as 422.
+    """
+    if request.url.path in _PROTECTED_PATHS:
+        try:
+            ensure_api_key(request)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=dict(exc.headers) if exc.headers else None,
+            )
+    return await call_next(request)
+
 
 # --- Pydantic Models ---
 class GenerateRequest(BaseModel):
@@ -157,6 +301,7 @@ def list_tools():
     "/api/resolve",
     response_model=ResolveResponse,
     summary="Resolve an issue with the tool-using agent loop",
+    dependencies=[Depends(require_api_key)],
 )
 def resolve_issue(request: ResolveRequest):
     """
@@ -168,6 +313,8 @@ def resolve_issue(request: ResolveRequest):
     - **async_mode=false** (default): runs inline and returns the finished job.
     - **async_mode=true**: returns immediately with status ``queued``/``running``;
       poll ``GET /api/jobs/{job_id}``.
+
+    Requires ``X-API-Key`` or ``Authorization: Bearer`` matching ``API_KEY``.
     """
     try:
         record = run_resolve_job(
@@ -218,13 +365,20 @@ def list_jobs():
     return {"jobs": job_store.list_jobs()}
 
 
-@app.post("/api/generate", response_model=GenerateResponse, summary="Generate Agent Response")
+@app.post(
+    "/api/generate",
+    response_model=GenerateResponse,
+    summary="Generate Agent Response",
+    dependencies=[Depends(require_api_key)],
+)
 async def generate(request: GenerateRequest):
     """
     Generates a response from the specified Ollama model based on the prompt.
 
     - **prompt**: The input text to the model.
     - **model**: The name of the Ollama model to use (e.g., 'llama2', 'codellama').
+
+    Requires ``X-API-Key`` or ``Authorization: Bearer`` matching ``API_KEY``.
     """
     try:
         ollama_response = ollama.chat(

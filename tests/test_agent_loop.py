@@ -169,10 +169,12 @@ def test_api_resolve_sync(sandbox_tools, monkeypatch):
     monkeypatch.setattr(agent_loop_mod, "run_resolve_job", patched_run_resolve_job)
     # main imports the function by name — patch there too
     monkeypatch.setattr("src.main.run_resolve_job", patched_run_resolve_job)
+    monkeypatch.setenv("API_KEY", "test-secret-key")
 
     client = TestClient(app)
     response = client.post(
         "/api/resolve",
+        headers={"X-API-Key": "test-secret-key"},
         json={"issue": "Write 42 to answer.txt", "max_steps": 5, "async_mode": False},
     )
     assert response.status_code == 200
