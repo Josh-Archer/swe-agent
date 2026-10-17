@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from src.tools import ToolResult, Tools
 
@@ -497,36 +499,62 @@ class AgentLoop:
 class JobStore:
     """SQLite-backed job registry and durable queue for resolve runs."""
 
+    LEASE_SECONDS = 60
+    HEARTBEAT_SECONDS = 10
+
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._db_path = Path(
             db_path or os.getenv("JOB_STORAGE_PATH", "data/jobs.db")
         )
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS resolve_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    result_json TEXT,
-                    error TEXT
-                )
-                """
-            )
-            # A process may have stopped while a job was running. Put it back
-            # on the durable queue so startup recovery can execute it again.
-            conn.execute(
-                "UPDATE resolve_jobs SET status = 'queued' WHERE status = 'running'"
-            )
+        self.owner_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+        self._initialized = False
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            fd = os.open(
+                self._db_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
         conn = sqlite3.connect(self._db_path, timeout=30)
+        os.chmod(self._db_path, 0o600)
         conn.row_factory = sqlite3.Row
         try:
             with conn:
+                if not self._initialized:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS resolve_jobs (
+                            job_id TEXT PRIMARY KEY,
+                            status TEXT NOT NULL,
+                            request_json TEXT NOT NULL,
+                            result_json TEXT,
+                            error TEXT,
+                            owner TEXT,
+                            heartbeat REAL
+                        )
+                        """
+                    )
+                    columns = {
+                        row["name"]
+                        for row in conn.execute(
+                            "PRAGMA table_info(resolve_jobs)"
+                        ).fetchall()
+                    }
+                    if "owner" not in columns:
+                        conn.execute("ALTER TABLE resolve_jobs ADD COLUMN owner TEXT")
+                    if "heartbeat" not in columns:
+                        conn.execute(
+                            "ALTER TABLE resolve_jobs ADD COLUMN heartbeat REAL"
+                        )
+                    self._initialized = True
                 yield conn
         finally:
             conn.close()
@@ -535,15 +563,18 @@ class JobStore:
     def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
-        return {
+        return sanitize_job_record({
             "job_id": row["job_id"],
             "status": row["status"],
             "request": json.loads(row["request_json"]),
             "result": json.loads(row["result_json"]) if row["result_json"] else None,
             "error": row["error"],
-        }
+        })
 
     def create(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        if "repo_url" in payload:
+            payload["repo_url"] = sanitize_repo_url(payload.get("repo_url"))
         with self._lock, self._connect() as conn:
             conn.execute(
                 """INSERT INTO resolve_jobs
@@ -553,27 +584,55 @@ class JobStore:
             )
         return self.get(job_id)  # type: ignore[return-value]
 
-    def set_running(self, job_id: str) -> None:
+    def claim(self, job_id: str) -> bool:
+        """Atomically claim a queued job for this process."""
+        with self._lock, self._connect() as conn:
+            changed = conn.execute(
+                """UPDATE resolve_jobs
+                   SET status = 'running', owner = ?, heartbeat = ?
+                   WHERE job_id = ? AND status = 'queued'""",
+                (self.owner_id, time.time(), job_id),
+            )
+            return changed.rowcount == 1
+
+    def heartbeat(self, job_id: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE resolve_jobs SET status = 'running' WHERE job_id = ?",
-                (job_id,),
+                """UPDATE resolve_jobs SET heartbeat = ?
+                   WHERE job_id = ? AND status = 'running' AND owner = ?""",
+                (time.time(), job_id, self.owner_id),
             )
+
+    def requeue_stale_jobs(self, now: float | None = None) -> int:
+        """Requeue only running jobs whose heartbeat lease has expired."""
+        cutoff = (time.time() if now is None else now) - self.LEASE_SECONDS
+        with self._lock, self._connect() as conn:
+            changed = conn.execute(
+                """UPDATE resolve_jobs
+                   SET status = 'queued', owner = NULL, heartbeat = NULL
+                   WHERE status = 'running'
+                     AND (heartbeat IS NULL OR heartbeat < ?)""",
+                (cutoff,),
+            )
+            return changed.rowcount
 
     def set_result(self, job_id: str, result: AgentResult) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """UPDATE resolve_jobs
-                   SET status = ?, result_json = ?, error = NULL WHERE job_id = ?""",
-                (result.status, json.dumps(result.to_dict()), job_id),
+                   SET status = ?, result_json = ?, error = NULL,
+                       owner = NULL, heartbeat = NULL
+                   WHERE job_id = ? AND status = 'running' AND owner = ?""",
+                (result.status, json.dumps(result.to_dict()), job_id, self.owner_id),
             )
 
     def set_error(self, job_id: str, error: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                """UPDATE resolve_jobs SET status = 'error', error = ?
-                   WHERE job_id = ?""",
-                (error, job_id),
+                """UPDATE resolve_jobs SET status = 'error', error = ?,
+                       owner = NULL, heartbeat = NULL
+                   WHERE job_id = ? AND status = 'running' AND owner = ?""",
+                (error, job_id, self.owner_id),
             )
 
     def get(self, job_id: str) -> dict[str, Any] | None:
@@ -604,6 +663,31 @@ job_store = JobStore()
 _job_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="resolve-job")
 
 
+def sanitize_repo_url(repo_url: str | None) -> str | None:
+    """Remove username/password components from a repository URL."""
+    if repo_url is None:
+        return None
+    try:
+        parsed = urlsplit(repo_url)
+        if parsed.scheme and parsed.netloc and "@" in parsed.netloc:
+            host = parsed.netloc.rsplit("@", 1)[1]
+            return urlunsplit(parsed._replace(netloc=host))
+    except ValueError:
+        pass
+    return repo_url
+
+
+def sanitize_job_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a job record with any URL userinfo removed."""
+    safe = dict(record)
+    request = safe.get("request")
+    if isinstance(request, dict) and "repo_url" in request:
+        request = dict(request)
+        request["repo_url"] = sanitize_repo_url(request.get("repo_url"))
+        safe["request"] = request
+    return safe
+
+
 def run_resolve_job(
     issue: str,
     *,
@@ -625,6 +709,7 @@ def run_resolve_job(
     otherwise runs the agent loop inline and returns the finished record.
     """
     job_id = job_id or uuid.uuid4().hex
+    repo_url = sanitize_repo_url(repo_url)
     payload = {
         "issue": issue,
         "repo_url": repo_url,
@@ -638,7 +723,16 @@ def run_resolve_job(
         record = job_store.create(job_id, payload)
 
     def _execute() -> None:
-        job_store.set_running(job_id)
+        if not job_store.claim(job_id):
+            return
+        heartbeat_stop = threading.Event()
+
+        def keep_lease() -> None:
+            while not heartbeat_stop.wait(JobStore.HEARTBEAT_SECONDS):
+                job_store.heartbeat(job_id)
+
+        heartbeat_thread = threading.Thread(target=keep_lease, daemon=True)
+        heartbeat_thread.start()
         # Caller-supplied tools own their sandbox (tests); otherwise we
         # create one and must clean it up when the job finishes.
         owns_sandbox = tools is None
@@ -661,6 +755,8 @@ def run_resolve_job(
         except Exception as exc:  # noqa: BLE001
             job_store.set_error(job_id, str(exc))
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=JobStore.HEARTBEAT_SECONDS + 1)
             if owns_sandbox and loop is not None:
                 loop.tools.sandbox.cleanup()
 
@@ -677,6 +773,7 @@ def run_resolve_job(
 
 def resume_queued_jobs() -> None:
     """Submit durable queued jobs after application startup."""
+    job_store.requeue_stale_jobs()
     for record in job_store.queued_jobs():
         request = record["request"]
         _job_executor.submit(_execute_persisted_job, record["job_id"], request)

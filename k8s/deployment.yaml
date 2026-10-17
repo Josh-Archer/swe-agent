@@ -6,6 +6,8 @@ metadata:
     app: ai-agent
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ai-agent
