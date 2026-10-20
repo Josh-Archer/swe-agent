@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 import ollama
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from src.agent_loop import job_store, run_resolve_job
+from src.agent_loop import job_store, resume_queued_jobs, run_resolve_job
 from src.tools import Tools, _default_sandbox_root, host_mount_allowed
 
 # Load environment variables from .env file
@@ -135,6 +136,13 @@ async def require_api_key(
 
 
 # Initialize the FastAPI app
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Resume jobs persisted before a process restart."""
+    resume_queued_jobs()
+    yield
+
+
 app = FastAPI(
     title="AI Agent API",
     description=(
@@ -143,6 +151,7 @@ app = FastAPI(
         "POST /api/resolve and POST /api/generate require an API key."
     ),
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 
@@ -285,13 +294,19 @@ def list_tools():
         sandbox_root=str(_default_sandbox_root()),
         host_mount_allowed=host_mount_allowed(),
         notes=[
-            "No host mount by default: workspaces live under AGENT_SANDBOX_ROOT "
-            "(or a temp directory).",
+            (
+                "No host mount by default: workspaces live under AGENT_SANDBOX_ROOT "
+                "(or a temp directory)."
+            ),
             "File paths are confined to the workspace; traversal outside is rejected.",
-            "Commands run with workspace cwd and a hard timeout "
-            "(AGENT_COMMAND_TIMEOUT, default 60s).",
-            "This is application-level isolation; deploy in containers without "
-            "hostPath volumes for stronger boundaries.",
+            (
+                "Commands run with workspace cwd and a hard timeout "
+                "(AGENT_COMMAND_TIMEOUT, default 60s)."
+            ),
+            (
+                "This is application-level isolation; deploy in containers without "
+                "hostPath volumes for stronger boundaries."
+            ),
             "Set AGENT_ALLOW_HOST_MOUNT=true only when intentionally binding a host path.",
         ],
     )
@@ -333,7 +348,7 @@ def resolve_issue(request: ResolveRequest):
             result=record.get("result"),
             error=record.get("error"),
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -361,7 +376,7 @@ def get_job(job_id: str):
     summary="List resolve jobs",
 )
 def list_jobs():
-    """List in-memory resolve jobs (single-replica demo store)."""
+    """List persisted resolve jobs."""
     return {"jobs": job_store.list_jobs()}
 
 
@@ -387,7 +402,7 @@ async def generate(request: GenerateRequest):
         )
         response_content = ollama_response['message']['content']
         return GenerateResponse(response=response_content)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Broad exception for now, can be refined
         raise HTTPException(status_code=500, detail=str(e))
 

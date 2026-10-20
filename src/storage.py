@@ -26,7 +26,7 @@ class FeedbackRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "FeedbackRecord":
+    def from_dict(cls, data: dict[str, Any]) -> FeedbackRecord:
         return cls(
             feedback_id=data["feedback_id"],
             prompt=data["prompt"],
@@ -90,10 +90,9 @@ class SqliteFeedbackStorage(FeedbackStorage):
         return conn
 
     def _init_db(self) -> None:
-        with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
                     CREATE TABLE IF NOT EXISTS feedback (
                         feedback_id TEXT PRIMARY KEY,
                         prompt TEXT NOT NULL,
@@ -102,36 +101,34 @@ class SqliteFeedbackStorage(FeedbackStorage):
                         correction TEXT
                     )
                     """
-                )
-                conn.commit()
+            )
+            conn.commit()
 
     def save(self, record: FeedbackRecord) -> None:
-        with self._lock:
-            with self._connect() as conn:
-                conn.execute(
-                    """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
                     INSERT OR REPLACE INTO feedback
                         (feedback_id, prompt, response, is_correct, correction)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (
-                        record.feedback_id,
-                        record.prompt,
-                        record.response,
-                        1 if record.is_correct else 0,
-                        record.correction,
-                    ),
-                )
-                conn.commit()
+                (
+                    record.feedback_id,
+                    record.prompt,
+                    record.response,
+                    1 if record.is_correct else 0,
+                    record.correction,
+                ),
+            )
+            conn.commit()
 
     def get(self, feedback_id: str) -> FeedbackRecord | None:
-        with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT feedback_id, prompt, response, is_correct, correction "
-                    "FROM feedback WHERE feedback_id = ?",
-                    (feedback_id,),
-                ).fetchone()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT feedback_id, prompt, response, is_correct, correction "
+                "FROM feedback WHERE feedback_id = ?",
+                (feedback_id,),
+            ).fetchone()
         if row is None:
             return None
         return FeedbackRecord(

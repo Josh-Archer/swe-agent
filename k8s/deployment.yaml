@@ -6,6 +6,8 @@ metadata:
     app: ai-agent
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ai-agent
@@ -28,6 +30,8 @@ spec:
         # If running Ollama in the same cluster, you can use its service name.
         - name: OLLAMA_HOST
           value: "http://ollama-service:11434"
+        - name: JOB_STORAGE_PATH
+          value: "/app/data/jobs.db"
         # Required for /api/resolve and /api/generate. The process rejects
         # those routes when API_KEY is missing. Create the secret first:
         #   kubectl create secret generic ai-agent-secrets \
@@ -37,6 +41,9 @@ spec:
             secretKeyRef:
               name: ai-agent-secrets
               key: api-key
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
         # Liveness: process is up (does not require the model).
         livenessProbe:
           httpGet:
@@ -63,3 +70,7 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: ai-agent-data
