@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
@@ -64,7 +65,25 @@ class FileFeedbackStorage(FeedbackStorage):
         path = self._path_for(record.feedback_id)
         payload = json.dumps(record.to_dict(), indent=2, ensure_ascii=False)
         with self._lock:
-            path.write_text(payload, encoding="utf-8")
+            fd, temporary_path = tempfile.mkstemp(
+                dir=self._directory,
+                prefix=f".{record.feedback_id}.",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
+                    temporary_file.write(payload)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, path)
+                directory_fd = os.open(self._directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
 
     def get(self, feedback_id: str) -> FeedbackRecord | None:
         path = self._path_for(feedback_id)

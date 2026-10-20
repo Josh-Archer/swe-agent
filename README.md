@@ -37,11 +37,11 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
     pip install -r requirements.txt
     ```
 
-2.  **Set the API key** (required for `/api/resolve` and `/api/generate`):
+2.  **Set the API key** (required for `/api/resolve`, `/api/generate`, and `/api/feedback`):
     ```bash
     export API_KEY=dev-secret
     ```
-    Do not commit this value. When `API_KEY` is unset or blank, those two routes return `401`.
+    Do not commit this value. When `API_KEY` is unset or blank, those routes return `401`.
 
 3.  **Run the application:**
     ```bash
@@ -60,19 +60,19 @@ The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:late
 *   `GET /ready`: Readiness check. Public.
 *   `GET /api/tools`: List the minimal tool interface and sandbox safety notes.
 *   `POST /api/generate`: Takes a prompt and returns a response from the LLM. **Requires API key.**
-*   `POST /api/feedback`: Allows submitting feedback on the agent's responses to be used for future training.
+*   `POST /api/feedback`: Persists feedback on the agent's responses for future training. **Requires API key; request bodies are limited to 64 KB.**
 *   `POST /api/resolve`: Run the tool-using agent loop against an issue (sync or async job). **Requires API key.**
 *   `GET /api/jobs`: List persisted resolve jobs.
 *   `GET /api/jobs/{job_id}`: Fetch status/result for a resolve job.
 
 ### Authentication
 
-`POST /api/resolve` and `POST /api/generate` require the `API_KEY` environment variable. Send either header:
+`POST /api/resolve`, `POST /api/generate`, and `POST /api/feedback` require the `API_KEY` environment variable. Send either header:
 
 *   `X-API-Key: <API_KEY>`
 *   `Authorization: Bearer <API_KEY>`
 
-If `X-API-Key` is present it is the credential that is checked. Query parameters are ignored. A missing key, a wrong key, and a server with no `API_KEY` configured all receive `401` with `WWW-Authenticate: Bearer`. The comparison is constant-time. `/`, `/ready`, feedback, tool listing, and job status stay reachable without the key so probes and local inspection keep working.
+If `X-API-Key` is present it is the credential that is checked. Query parameters are ignored. A missing key, a wrong key, and a server with no `API_KEY` configured all receive `401` with `WWW-Authenticate: Bearer`. The comparison is constant-time. `/`, `/ready`, tool listing, and job status stay reachable without the key so probes and local inspection keep working. Feedback requests are limited to 64 KB, with per-field length limits.
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/api/generate" \
@@ -141,8 +141,10 @@ Important environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve` and `/api/generate` |
+| `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve`, `/api/generate`, and `/api/feedback` |
 | `AGENT_SANDBOX_ROOT` | system temp subdir | Root directory for all agent workspaces |
+| `FEEDBACK_STORAGE_BACKEND` | `sqlite` | Feedback storage backend: `sqlite` or `file` |
+| `FEEDBACK_STORAGE_PATH` | `data/feedback.db` | SQLite database path or JSON feedback directory, depending on backend |
 | `JOB_STORAGE_PATH` | `data/jobs.db` | SQLite database for durable resolve job requests, statuses, and results |
 | `AGENT_ALLOW_HOST_MOUNT` | `false` | If `true`, allow binding an arbitrary host path as a workspace |
 | `AGENT_COMMAND_TIMEOUT` | `60` | Default command timeout (seconds) |
