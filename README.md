@@ -141,7 +141,7 @@ Important environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve` and `/api/generate` |
+| `API_KEY` | unset (protected routes reject) | Shared secret required on `/api/resolve`, `/api/generate`, and `/api/feedback` |
 | `AGENT_SANDBOX_ROOT` | system temp subdir | Root directory for all agent workspaces |
 | `FEEDBACK_STORAGE_BACKEND` | `sqlite` | Feedback storage backend: `sqlite` or `file` |
 | `FEEDBACK_STORAGE_PATH` | `data/feedback.db` | SQLite database path or JSON feedback directory, depending on backend |

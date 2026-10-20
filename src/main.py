@@ -181,12 +181,15 @@ async def reject_unauthenticated_protected_routes(request: Request, call_next):
             )
     if request.url.path == "/api/feedback":
         content_length = request.headers.get("content-length")
-        if content_length and content_length.isdecimal():
-            if int(content_length) > MAX_FEEDBACK_BODY_BYTES:
-                return JSONResponse(
-                    status_code=413,
-                    content={"detail": "Request body exceeds 64 KB limit"},
-                )
+        if (
+            content_length
+            and content_length.isdecimal()
+            and int(content_length) > MAX_FEEDBACK_BODY_BYTES
+        ):
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body exceeds 64 KB limit"},
+            )
         body = bytearray()
         async for chunk in request.stream():
             body.extend(chunk)
