@@ -14,7 +14,7 @@ permissions:
 jobs:
   test:
     name: Run Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
 
     steps:
       - name: Check out code
@@ -35,7 +35,7 @@ jobs:
 
   build-and-push:
     name: Build and Push Docker Image
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs: test # This job depends on the 'test' job completing successfully
     if: github.ref == 'refs/heads/main' # Only run this on pushes to main
     permissions:
