@@ -21,14 +21,9 @@ This project provides a template for creating a k3s-deployable AI agent that wra
 *   A Kubernetes cluster (like k3s or minikube)
 *   `kubectl` configured to connect to your cluster
 
-### CI/CD Setup
+### Container Image
 
-The GitHub Actions workflow in `.github/workflows/ci.yaml` is configured to build and push a Docker image to the GitHub Container Registry (GHCR). To make it work, you need to add the following secrets to your GitHub repository settings:
-
-*   `DOCKERHUB_USERNAME`: Your Docker Hub username (or other registry username).
-*   `DOCKERHUB_TOKEN`: A personal access token with permissions to push images to the registry.
-
-The image will be tagged and pushed as `ghcr.io/YOUR_USERNAME/YOUR_REPONAME:latest`. You will need to update the `k8s/deployment.yaml` file to use this image path.
+There is no GitHub Actions CI/CD pipeline. Build and push the image manually (e.g. `docker build -t ghcr.io/YOUR_USERNAME/YOUR_REPONAME:latest . && docker push ...`) and update `k8s/deployment.yaml` to use that image path.
 
 ### Local Development
 
