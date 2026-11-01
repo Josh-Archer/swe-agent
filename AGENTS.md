@@ -19,4 +19,4 @@ This document provides instructions for AI agents working on this codebase.
 
 ## CI/CD
 
-The CI/CD pipeline is defined in `.github/workflows/ci.yaml`. It automates testing and container image publishing. When modifying the workflow, ensure it remains robust and efficient. The image is pushed to a container registry, and the Kubernetes manifests should be updated accordingly.
+There is currently no GitHub Actions CI/CD pipeline; the former `.github/workflows/ci.yaml` was removed. Run tests locally and build/push the container image manually, updating the Kubernetes manifests accordingly.
